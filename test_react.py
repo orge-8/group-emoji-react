@@ -379,6 +379,39 @@ async def test_decision_label_reflects_fallback() -> bool:
     return True
 
 
+async def test_cooldown_reserved_at_decision() -> bool:
+    """v1.1.3 防连刷：冷却在决策通过时即占用，LLM 等待期内的后续消息不再触发。
+
+    旧版冷却只在贴成功后记录，LLM 选表情最长等 llm_timeout_ms，期间
+    后续消息全部通过冷却检查，热闹群里一次突发可能连刷多条表情。
+    """
+    host = FakeHost(llm_delay=0.3)  # LLM 慢返回，制造冷却空窗
+    plugin = await make_plugin(host)
+    plugin.config.proactive.chance = 1.0
+    plugin.config.proactive.keyword_chance = 1.0
+    plugin.config.proactive.cooldown_seconds = 60
+    plugin.config.proactive.min_text_length = 1
+
+    second = dict(GROUP_MESSAGE)
+    second["processed_plain_text"] = "这波真是离谱到家了"
+    second["raw_message"] = {"message_id": "556", "self_id": "999"}
+
+    # 两条消息背靠背入站（第二条不等第一条贴完）：第二条必须被已占用的冷却拦下
+    await plugin.observe_group_message(message=GROUP_MESSAGE)
+    await plugin.observe_group_message(message=second)
+    await asyncio.gather(*list(plugin._tasks))
+
+    calls = host.react_calls()
+    if len(calls) != 1:
+        print(f"[FAIL] LLM 等待期内后续消息应被冷却拦截，实际贴了 {len(calls)} 次")
+        return False
+    if str(calls[0]["payload"].get("message_id")) != "555":
+        print(f"[FAIL] 应只贴第一条消息 555，实际贴了 {calls[0]['payload'].get('message_id')}")
+        return False
+    print("[PASS] 冷却决策期即占用：LLM 等待期内后续消息不触发，防连刷生效")
+    return True
+
+
 async def test_command_selfcheck() -> bool:
     """自检命令应回复中文状态，且绝不回显 Token。"""
     host = FakeHost()
@@ -411,6 +444,7 @@ async def main() -> int:
         test_proactive_llm_error_falls_back,
         test_proactive_timeout_when_target_not_in_recent,
         test_decision_label_reflects_fallback,
+        test_cooldown_reserved_at_decision,
         test_command_selfcheck,
     ]
     results = []

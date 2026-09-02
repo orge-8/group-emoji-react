@@ -164,7 +164,8 @@ class GroupEmojiReactPlugin(MaiBotPlugin):
         """
         super().__init__(*args, **kwargs)
         self._proactive_last_react_at: dict = {}
-        self._reacted_message_ids: set = set()
+        # 用 dict 的插入序当 FIFO（容量 _MAX_TRACKED_MESSAGE_IDS，满了淘汰最旧一条）
+        self._reacted_message_ids: dict = {}
         self._tasks: set = set()
 
     async def on_load(self) -> None:
@@ -237,6 +238,11 @@ class GroupEmojiReactPlugin(MaiBotPlugin):
             return {"action": "continue"}
         if not self._should_try_proactive(chat_id or group_id, message_id, text):
             return {"action": "continue"}
+
+        # 决策通过即占住冷却槽：LLM 选表情最长要等 llm_timeout_ms，若等贴成功才记冷却，
+        # 这段时间内后续消息会全部通过冷却检查、各自再触发一次，热闹群里会连刷。
+        # 失败也消耗冷却，天然防刷。
+        self._proactive_last_react_at[chat_id or group_id] = time.time()
 
         self._spawn(
             self._proactive_react(
@@ -657,10 +663,17 @@ class GroupEmojiReactPlugin(MaiBotPlugin):
         return random.random() < chance
 
     def _remember_message_id(self, message_id: str) -> None:
-        """记录已贴过的消息，避免 hook 与事件监听重复触发。"""
+        """记录已贴过的消息，避免 hook 与事件监听重复触发。
+
+        dict 按插入序当 FIFO：满了淘汰最旧一条，而不是整体清空
+        （整体清空会瞬间丢掉全部去重状态，旧消息理论上可被重复贴）。
+        """
+        if message_id in self._reacted_message_ids:
+            return
         if len(self._reacted_message_ids) >= _MAX_TRACKED_MESSAGE_IDS:
-            self._reacted_message_ids.clear()
-        self._reacted_message_ids.add(message_id)
+            oldest = next(iter(self._reacted_message_ids))
+            self._reacted_message_ids.pop(oldest, None)
+        self._reacted_message_ids[message_id] = True
 
     @staticmethod
     def _looks_reactable(content: str) -> bool:

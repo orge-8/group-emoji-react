@@ -1,7 +1,7 @@
 {
   "manifest_version": 2,
   "id": "org.mai-mai.group-emoji-react",
-  "version": "1.1.2",
+  "version": "1.1.3",
   "name": "群聊贴表情",
   "description": "通过 Napcat API 让麦麦在群聊里给消息贴表情：由 LLM 从 30 个内置表情中挑选合适的那个，支持「麦麦主动贴」和「LLM 主动贴」两条路径。主动路径带 LLM 超时回退与纯规则模式，保证贴表情低延迟。仅群聊生效，不发送文字、不打断正常聊天。",
   "author": {

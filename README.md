@@ -82,7 +82,7 @@
 - **入站监听用 hook，不要用 `EventHandler(EventType.ON_MESSAGE)`**：部分 MaiBot 版本里 `ON_MESSAGE` 的派发被注释掉，注册了也永远不触发。本插件用 `chat.receive.after_process`（`HookMode.OBSERVE` + `ErrorPolicy.SKIP`），只读不改写消息，插件出错也不会影响聊天。
 - **`plugin.py` 不要写 `from __future__ import annotations`**：Runner 用 `spec_from_file_location` 加载且不注册进 `sys.modules`，注解会变成字符串，pydantic 解析配置模型会直接失败。
 - **`http.client` 是阻塞的**：所有 Napcat 请求都包在 `asyncio.to_thread` 里，避免卡住插件 Runner 的事件循环。
-- **去重 + 冷却**：以消息 ID 去重（hook 与事件监听可能对同一条消息各触发一次），按聊天流冷却，`on_unload` 会取消所有未完成的后台任务。
+- **去重 + 冷却**：以消息 ID 去重（hook 与事件监听可能对同一条消息各触发一次，容量 1000，FIFO 淘汰最旧），按聊天流冷却；冷却在决策通过时即占用，避免 LLM 选表情的等待期（最长 `llm_timeout_ms`）内后续消息连刷，失败也消耗冷却。`on_unload` 会取消所有未完成的后台任务。
 - 内部状态在 `__init__` 初始化而非 `on_load`，保证任何组件先于生命周期被触发时也不会崩。
 - **主动路径低延迟设计**：LLM 选表情带 `llm_timeout_ms` 超时（默认 6s），超时/异常/关闭时回退到内置关键词规则（关键词 → 候选表情池随机），保证表情"跟得上"聊天节奏；工具路径（LLM 主动调用）不回退，保持 LLM 决策纯度。
 
@@ -92,7 +92,7 @@
 cd MaiBot插件开发
 .venv/Scripts/python.exe check_plugin.py plugins/group-emoji-react   # 结构自检
 .venv/Scripts/python.exe smoke_test.py  plugins/group-emoji-react   # 生命周期冒烟
-.venv/Scripts/python.exe plugins/group-emoji-react/test_react.py    # 行为回归（10 项，含 FakeHost 打桩）
+.venv/Scripts/python.exe plugins/group-emoji-react/test_react.py    # 行为回归（13 项，含 FakeHost 打桩）
 ```
 
 `test_react.py` 不需要 MaiBot 也不需要真实 Napcat：用 FakeHost 模拟 LLM/消息/发送，并把 HTTP 调用换成录制桩，验证"入站消息 → 提取字段 → 选表情 → 调 Napcat"主链路、私聊跳过、重复消息去重、非法表情拦截、LLM 关闭/超时/异常三种回退场景、自检命令不泄露 Token。
