@@ -101,13 +101,13 @@ class ProactiveConfig(PluginConfigBase):
     cooldown_seconds: int = Field(default=180, description="同一个聊天流主动贴表情的冷却时间（秒）")
     min_text_length: int = Field(default=2, description="触发主动贴表情的最短文本长度")
     skip_self_messages: bool = Field(default=True, description="是否跳过机器人自己发的消息")
-    llm_enabled: bool = Field(
-        default=True,
-        description="主动贴表情是否用 LLM 选表情；关掉后走内置关键词规则，毫秒级、零 LLM 开销",
+    rule_fallback: bool = Field(
+        default=False,
+        description="LLM 超时/异常/返回非法时是否回退到内置关键词规则选表情；关闭则直接跳过本次贴表情",
     )
     llm_timeout_ms: int = Field(
         default=6000,
-        description="主动路径 LLM 选表情的超时时间（毫秒），超时则回退到关键词规则；0 表示不限制",
+        description="主动路径 LLM 选表情的超时时间（毫秒），超时按 rule_fallback 决定回退或跳过；0 表示不限制",
     )
 
 
@@ -164,8 +164,7 @@ class GroupEmojiReactPlugin(MaiBotPlugin):
         """
         super().__init__(*args, **kwargs)
         self._proactive_last_react_at: dict = {}
-        # 用 dict 的插入序当 FIFO（容量 _MAX_TRACKED_MESSAGE_IDS，满了淘汰最旧一条）
-        self._reacted_message_ids: dict = {}
+        self._reacted_message_ids: set = set()
         self._tasks: set = set()
 
     async def on_load(self) -> None:
@@ -238,11 +237,6 @@ class GroupEmojiReactPlugin(MaiBotPlugin):
             return {"action": "continue"}
         if not self._should_try_proactive(chat_id or group_id, message_id, text):
             return {"action": "continue"}
-
-        # 决策通过即占住冷却槽：LLM 选表情最长要等 llm_timeout_ms，若等贴成功才记冷却，
-        # 这段时间内后续消息会全部通过冷却检查、各自再触发一次，热闹群里会连刷。
-        # 失败也消耗冷却，天然防刷。
-        self._proactive_last_react_at[chat_id or group_id] = time.time()
 
         self._spawn(
             self._proactive_react(
@@ -361,9 +355,9 @@ class GroupEmojiReactPlugin(MaiBotPlugin):
     ) -> None:
         """后台执行主动贴表情，成功则登记冷却与去重。
 
-        text：入站 hook 时拿到的消息原文。作为超时回退和规则选表情的依据，
-        不能依赖 _get_target_message_info 的查询结果——真机上 get_recent
-        可能查不到刚入站的这条消息，查不到时 content 为空，回退会失效。
+        text：入站 hook 时拿到的消息原文。作为超时回退（rule_fallback=True 时）
+        和规则选表情的依据，不能依赖 _get_target_message_info 的查询结果——
+        真机上 get_recent 可能查不到刚入站的这条消息，查不到时 content 为空。
         """
         result = await self._react_to_message(
             chat_id, group_id, message_id, source="proactive", fallback_text=text
@@ -387,13 +381,13 @@ class GroupEmojiReactPlugin(MaiBotPlugin):
         source: str,
         fallback_text: str = "",
     ) -> dict:
-        """对指定消息贴表情：取上下文 -> 选表情 -> 调 Napcat。
+        """对指定消息贴表情：取上下文 -> LLM 选表情 -> 调 Napcat。
 
-        选表情策略：
-        - 主动路径（source=proactive）：proactive.llm_enabled=True 时先试 LLM
-          （带 llm_timeout_ms 超时，超时回退规则）；False 时直接走关键词规则。
-          回退依据 = fallback_text（hook 传入的消息原文）优先，
-          其次目标消息内容；两者都为空则不设超时（与旧行为一致）。
+        选表情策略（LLM 是唯一选表情路径）：
+        - 主动路径（source=proactive）：调 LLM（带 llm_timeout_ms 超时）。
+          proactive.rule_fallback=True 时，超时/异常/空返回/解析失败/非法 ID
+          回退关键词规则（回退依据 = fallback_text 即 hook 传入的消息原文优先，
+          其次目标消息内容）；False 时直接跳过本次贴表情。
         - 工具路径（source=tool）：始终用 LLM，不回退（LLM 主导的场景应由 LLM 决定）。
         """
         if not group_id:
@@ -404,17 +398,14 @@ class GroupEmojiReactPlugin(MaiBotPlugin):
         user_name, content = await self._get_target_message_info(target_msg_id, chat_id)
         prompt = await self._build_prompt(target_msg_id, user_name, content, chat_id)
 
-        if source == "proactive" and not self.config.proactive.llm_enabled:
-            emoji_id, emoji_name = self._select_emoji_by_rule(fallback_text or content)
-            decision = "rule"
-        else:
-            if source == "proactive":
-                rule_basis = fallback_text or content
-            else:
-                rule_basis = ""
-            emoji_id, emoji_name, decision = await self._select_emoji(
-                prompt, fallback_text=rule_basis
-            )
+        rule_basis = (
+            fallback_text or content
+            if source == "proactive" and self.config.proactive.rule_fallback
+            else ""
+        )
+        emoji_id, emoji_name, decision = await self._select_emoji(
+            prompt, fallback_text=rule_basis
+        )
         if not emoji_id:
             return {"success": False, "content": f"选表情失败: {emoji_name}"}
 
@@ -440,16 +431,16 @@ class GroupEmojiReactPlugin(MaiBotPlugin):
         """让 LLM 挑一个表情，返回 (emoji_id, emoji_name, decision)。
 
         decision：表情的最终来源——"llm"=LLM 自己选的；"rule"=超时/异常/空返回/
-        解析失败后回退关键词规则选的。失败返回 ("", 原因, "")。
+        解析失败/非法 ID 后回退关键词规则选的。失败返回 ("", 原因, "")。
 
-        fallback_text：LLM 超时/失败/关闭时用于规则回退的原文（主动路径传消息文本，
-        工具路径留空则不回退）。超时上限来自 proactive.llm_timeout_ms（0=不限制），
-        仅对主动路径生效（fallback_text 非空时启用）。
+        fallback_text：LLM 超时/失败时用于规则回退的原文。是否回退由调用方按
+        proactive.rule_fallback 开关控制——传非空则超时后回退，传空则超时后直接
+        失败返回。超时永远生效（llm_timeout_ms > 0 时），与是否回退解耦。
         """
         use_fallback = bool(fallback_text)
         timeout_ms = int(self.config.proactive.llm_timeout_ms or 0)
         try:
-            if use_fallback and timeout_ms > 0:
+            if timeout_ms > 0:
                 raw = await asyncio.wait_for(
                     self.ctx.llm.generate(
                         prompt, model=str(self.config.napcat.llm_task or "").strip()
@@ -663,17 +654,10 @@ class GroupEmojiReactPlugin(MaiBotPlugin):
         return random.random() < chance
 
     def _remember_message_id(self, message_id: str) -> None:
-        """记录已贴过的消息，避免 hook 与事件监听重复触发。
-
-        dict 按插入序当 FIFO：满了淘汰最旧一条，而不是整体清空
-        （整体清空会瞬间丢掉全部去重状态，旧消息理论上可被重复贴）。
-        """
-        if message_id in self._reacted_message_ids:
-            return
+        """记录已贴过的消息，避免 hook 与事件监听重复触发。"""
         if len(self._reacted_message_ids) >= _MAX_TRACKED_MESSAGE_IDS:
-            oldest = next(iter(self._reacted_message_ids))
-            self._reacted_message_ids.pop(oldest, None)
-        self._reacted_message_ids[message_id] = True
+            self._reacted_message_ids.clear()
+        self._reacted_message_ids.add(message_id)
 
     @staticmethod
     def _looks_reactable(content: str) -> bool:

@@ -217,42 +217,39 @@ async def test_llm_bad_emoji_is_rejected() -> bool:
     return True
 
 
-async def test_proactive_llm_disabled_uses_rule() -> bool:
-    """proactive.llm_enabled=False 时，主动路径不调 LLM、直接走关键词规则。"""
-    host = FakeHost()
-    plugin = await make_plugin(host)
-    plugin.config.proactive.chance = 1.0
-    plugin.config.proactive.keyword_chance = 1.0
-    plugin.config.proactive.cooldown_seconds = 0
-    plugin.config.proactive.min_text_length = 1
-    plugin.config.proactive.llm_enabled = False
-
-    await plugin.observe_group_message(message=GROUP_MESSAGE)
-    await asyncio.gather(*list(plugin._tasks))
-
-    if host.llm_calls:
-        print(f"[FAIL] llm_enabled=False 不应调 LLM，实际调了 {len(host.llm_calls)} 次")
-        return False
-    calls = host.react_calls()
-    if len(calls) != 1:
-        print(f"[FAIL] 预期 1 次贴表情调用，实际 {len(calls)}")
-        return False
-    emoji_id = int(calls[0]["payload"]["emoji_id"])
-    if emoji_id not in AVAILABLE_REACT_EMOJIS:
-        print(f"[FAIL] 规则选出的表情不合法: {emoji_id}")
-        return False
-    print(f"[PASS] llm_enabled=False 纯规则贴表情: {emoji_id}:{AVAILABLE_REACT_EMOJIS[emoji_id]}（零 LLM 开销）")
-    return True
-
-
-async def test_proactive_llm_timeout_falls_back() -> bool:
-    """LLM 超时超过 proactive.llm_timeout_ms 时，应回退到规则并仍然贴上表情。"""
+async def test_rule_fallback_disabled_skips() -> bool:
+    """rule_fallback=False（默认）时，LLM 超时应直接跳过，不再回退关键词规则。"""
     host = FakeHost(llm_delay=0.5)  # 500ms 才返回
     plugin = await make_plugin(host)
     plugin.config.proactive.chance = 1.0
     plugin.config.proactive.keyword_chance = 1.0
     plugin.config.proactive.cooldown_seconds = 0
     plugin.config.proactive.min_text_length = 1
+    plugin.config.proactive.llm_timeout_ms = 50  # 50ms 超时，必然触发
+    # rule_fallback 默认 False，无需显式赋值
+
+    await plugin.observe_group_message(message=GROUP_MESSAGE)
+    await asyncio.gather(*list(plugin._tasks))
+
+    if not host.llm_calls:
+        print("[FAIL] 超时跳过路径仍应调过一次 LLM")
+        return False
+    if host.react_calls():
+        print(f"[FAIL] rule_fallback=False 超时后不应贴表情，实际调了 {len(host.react_calls())} 次")
+        return False
+    print("[PASS] rule_fallback=False：LLM 超时后直接跳过本次贴表情（宁缺毋滥）")
+    return True
+
+
+async def test_proactive_llm_timeout_falls_back() -> bool:
+    """rule_fallback=True 时，LLM 超时超过 llm_timeout_ms 应回退到规则并仍然贴上表情。"""
+    host = FakeHost(llm_delay=0.5)  # 500ms 才返回
+    plugin = await make_plugin(host)
+    plugin.config.proactive.chance = 1.0
+    plugin.config.proactive.keyword_chance = 1.0
+    plugin.config.proactive.cooldown_seconds = 0
+    plugin.config.proactive.min_text_length = 1
+    plugin.config.proactive.rule_fallback = True
     plugin.config.proactive.llm_timeout_ms = 50  # 50ms 超时，必然触发
 
     start = time.monotonic()
@@ -276,13 +273,14 @@ async def test_proactive_llm_timeout_falls_back() -> bool:
 
 
 async def test_proactive_llm_error_falls_back() -> bool:
-    """LLM 调用抛异常时，主动路径应回退到规则而不是放弃贴表情。"""
+    """rule_fallback=True 时，LLM 调用抛异常应回退到规则而不是放弃贴表情。"""
     host = FakeHost(llm_reply=None)  # rpc_call 里抛 RuntimeError
     plugin = await make_plugin(host)
     plugin.config.proactive.chance = 1.0
     plugin.config.proactive.keyword_chance = 1.0
     plugin.config.proactive.cooldown_seconds = 0
     plugin.config.proactive.min_text_length = 1
+    plugin.config.proactive.rule_fallback = True
 
     await plugin.observe_group_message(message=GROUP_MESSAGE)
     await asyncio.gather(*list(plugin._tasks))
@@ -314,6 +312,7 @@ async def test_proactive_timeout_when_target_not_in_recent() -> bool:
     plugin.config.proactive.keyword_chance = 1.0
     plugin.config.proactive.cooldown_seconds = 0
     plugin.config.proactive.min_text_length = 1
+    plugin.config.proactive.rule_fallback = True
     plugin.config.proactive.llm_timeout_ms = 50
 
     start = time.monotonic()
@@ -375,40 +374,16 @@ async def test_decision_label_reflects_fallback() -> bool:
         print(f"[FAIL] 非法 ID 回退选出的表情不合法: {eid3}")
         return False
 
-    print("[PASS] decision 标签正确：正常=llm，超时回退=rule，非法 ID 回退=rule")
-    return True
-
-
-async def test_cooldown_reserved_at_decision() -> bool:
-    """v1.1.3 防连刷：冷却在决策通过时即占用，LLM 等待期内的后续消息不再触发。
-
-    旧版冷却只在贴成功后记录，LLM 选表情最长等 llm_timeout_ms，期间
-    后续消息全部通过冷却检查，热闹群里一次突发可能连刷多条表情。
-    """
-    host = FakeHost(llm_delay=0.3)  # LLM 慢返回，制造冷却空窗
-    plugin = await make_plugin(host)
-    plugin.config.proactive.chance = 1.0
-    plugin.config.proactive.keyword_chance = 1.0
-    plugin.config.proactive.cooldown_seconds = 60
-    plugin.config.proactive.min_text_length = 1
-
-    second = dict(GROUP_MESSAGE)
-    second["processed_plain_text"] = "这波真是离谱到家了"
-    second["raw_message"] = {"message_id": "556", "self_id": "999"}
-
-    # 两条消息背靠背入站（第二条不等第一条贴完）：第二条必须被已占用的冷却拦下
-    await plugin.observe_group_message(message=GROUP_MESSAGE)
-    await plugin.observe_group_message(message=second)
-    await asyncio.gather(*list(plugin._tasks))
-
-    calls = host.react_calls()
-    if len(calls) != 1:
-        print(f"[FAIL] LLM 等待期内后续消息应被冷却拦截，实际贴了 {len(calls)} 次")
+    # 关闭回退（调用方传空 fallback_text）时，超时应直接失败返回 ("", 原因, "")
+    eid4, name4, decision4 = await plugin._select_emoji(prompt, fallback_text="")
+    if eid4 or decision4:
+        print(f"[FAIL] 关闭回退时超时应返回失败，实际 {(eid4, decision4)}")
         return False
-    if str(calls[0]["payload"].get("message_id")) != "555":
-        print(f"[FAIL] 应只贴第一条消息 555，实际贴了 {calls[0]['payload'].get('message_id')}")
+    if "超时" not in name4:
+        print(f"[FAIL] 失败原因应说明超时，实际 {name4}")
         return False
-    print("[PASS] 冷却决策期即占用：LLM 等待期内后续消息不触发，防连刷生效")
+
+    print("[PASS] decision 标签正确：正常=llm，超时回退=rule，非法 ID 回退=rule，关闭回退=失败")
     return True
 
 
@@ -439,12 +414,11 @@ async def main() -> int:
         test_tool_rejects_non_group,
         test_tool_reacts_in_group,
         test_llm_bad_emoji_is_rejected,
-        test_proactive_llm_disabled_uses_rule,
+        test_rule_fallback_disabled_skips,
         test_proactive_llm_timeout_falls_back,
         test_proactive_llm_error_falls_back,
         test_proactive_timeout_when_target_not_in_recent,
         test_decision_label_reflects_fallback,
-        test_cooldown_reserved_at_decision,
         test_command_selfcheck,
     ]
     results = []

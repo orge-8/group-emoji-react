@@ -28,10 +28,10 @@ cooldown_seconds = 180
 min_text_length = 2
 # 跳过机器人自己发的消息
 skip_self_messages = true
-# 主动贴表情是否用 LLM 选表情。真机上 LLM 调用可能要 15-20s（如 planner 任务配的是
-# LongCat 等大模型），导致表情贴得太慢；关掉后走内置关键词规则，毫秒级、零 LLM 开销。
-# 建议：追求"表情跟得快"就关掉（false），追求"表情选得准"就开着（true）
-llm_enabled = true
-# 主动路径 LLM 选表情的超时（毫秒），超时回退关键词规则；0 = 不限制（死等 LLM）
-# 真机日志里 LLM 耗时 19.4s，默认 6000ms 能兜住大部分慢模型场景
+# LLM 选表情失败（超时/异常/返回非法）时是否回退到内置关键词规则。
+# false（默认）：直接跳过本次贴表情，宁缺毋滥，不贴不合语境的表情
+# true：回退关键词规则，保证贴得上但选得比较粗（真机实测延迟 ~6s 内）
+rule_fallback = false
+# 主动路径 LLM 选表情的超时（毫秒），超时按 rule_fallback 决定回退或跳过
+# 0 = 不限制（死等 LLM）；真机日志里 LLM 耗时 19.4s，默认 6000ms 能兜住大部分慢模型场景
 llm_timeout_ms = 6000
