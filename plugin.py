@@ -18,6 +18,7 @@ import http.client
 import json
 import random
 import time
+from collections import deque
 from typing import Any
 
 from maibot_sdk import Command, Field, HookHandler, MaiBotPlugin, PluginConfigBase, Tool
@@ -58,6 +59,11 @@ _REACTABLE_KEYWORDS: tuple = (
 )
 
 _MAX_TRACKED_MESSAGE_IDS = 1000
+# 冷却记录字典的惰性淘汰上限：超过才清理，避免每次写入都扫表
+_MAX_COOLDOWN_ENTRIES = 512
+
+# prompt 里的表情清单字符串：AVAILABLE_REACT_EMOJIS 是模块级常量，预拼一次复用
+_EMOJI_LIST_PROMPT: str = ", ".join(f"{eid}:{name}" for eid, name in AVAILABLE_REACT_EMOJIS.items())
 
 
 class PluginSectionConfig(PluginConfigBase):
@@ -164,7 +170,10 @@ class GroupEmojiReactPlugin(MaiBotPlugin):
         """
         super().__init__(*args, **kwargs)
         self._proactive_last_react_at: dict = {}
+        # 去重滑动窗口：set 负责 O(1) 查询，deque(maxlen) 负责 FIFO 挤掉最旧条目，
+        # 替代之前"到 1000 条整体 clear()"——clear 瞬间会让所有历史消息失去去重保护。
         self._reacted_message_ids: set = set()
+        self._reacted_message_id_queue: deque = deque(maxlen=_MAX_TRACKED_MESSAGE_IDS)
         self._tasks: set = set()
 
     async def on_load(self) -> None:
@@ -356,14 +365,14 @@ class GroupEmojiReactPlugin(MaiBotPlugin):
         """后台执行主动贴表情，成功则登记冷却与去重。
 
         text：入站 hook 时拿到的消息原文。作为超时回退（rule_fallback=True 时）
-        和规则选表情的依据，不能依赖 _get_target_message_info 的查询结果——
+        和规则选表情的依据，不能依赖 get_recent 的查询结果——
         真机上 get_recent 可能查不到刚入站的这条消息，查不到时 content 为空。
         """
         result = await self._react_to_message(
             chat_id, group_id, message_id, source="proactive", fallback_text=text
         )
         if result.get("success"):
-            self._proactive_last_react_at[chat_id] = time.time()
+            self._record_cooldown(chat_id)
             self._remember_message_id(message_id)
             self.ctx.logger.info("主动贴表情成功: message_id=%s", message_id)
         else:
@@ -395,8 +404,20 @@ class GroupEmojiReactPlugin(MaiBotPlugin):
         if not target_msg_id:
             return {"success": False, "content": "没有可用的目标消息"}
 
-        user_name, content = await self._get_target_message_info(target_msg_id, chat_id)
-        prompt = await self._build_prompt(target_msg_id, user_name, content, chat_id)
+        # 只拉一次最近消息（limit=20 覆盖目标查找），目标消息提取与 prompt 上下文
+        #（取前 10 条）复用同一份结果，避免连续两次 get_recent RPC。
+        recent = await self._get_recent_messages(chat_id, limit=20)
+        user_name, content = "未知用户", ""
+        for msg in recent:
+            if str(msg.get("message_id", "")) != target_msg_id:
+                continue
+            info = msg.get("message_info") or {}
+            user = (info.get("user_info") or {}) if isinstance(info, dict) else {}
+            user_name = str(user.get("user_nickname") or "未知用户")
+            content = str(msg.get("processed_plain_text") or "")[:120]
+            break
+
+        prompt = self._build_prompt(target_msg_id, user_name, content, recent[:10])
 
         rule_basis = (
             fallback_text or content
@@ -525,12 +546,10 @@ class GroupEmojiReactPlugin(MaiBotPlugin):
             return str(result.get("response") or result.get("content") or result.get("text") or "")
         return str(result or "")
 
-    async def _build_prompt(
-        self, target_msg_id: str, user_name: str, content: str, chat_id: str
+    def _build_prompt(
+        self, target_msg_id: str, user_name: str, content: str, recent: list
     ) -> str:
-        """构造选表情的 prompt。"""
-        emoji_list = ", ".join(f"{eid}:{name}" for eid, name in AVAILABLE_REACT_EMOJIS.items())
-        recent = await self._get_recent_messages(chat_id, limit=10)
+        """构造选表情的 prompt。recent 由调用方提供（与目标消息提取共用同一次 get_recent）。"""
 
         if recent:
             lines = []
@@ -551,7 +570,7 @@ class GroupEmojiReactPlugin(MaiBotPlugin):
             "你是一个正在群里聊天的网友，需要给「目标消息」选一个最合适的反应表情。\n\n"
             f"目标消息：\n- ID: {target_msg_id}\n- 发送者: {user_name}\n- 内容: {content[:120]}\n\n"
             f"最近聊天记录（格式：消息ID,时间,昵称:内容）：\n{context}\n\n"
-            f"可用表情（ID:名称）：\n{emoji_list}\n\n"
+            f"可用表情（ID:名称）：\n{_EMOJI_LIST_PROMPT}\n\n"
             "请只返回一个 JSON 对象，不要有任何解释或多余文字：\n"
             '{"emoji_id": "表情ID数字", "reason": "简短理由，10字以内"}'
         )
@@ -572,17 +591,6 @@ class GroupEmojiReactPlugin(MaiBotPlugin):
         """取最新一条消息的 ID。"""
         recent = await self._get_recent_messages(chat_id, limit=1)
         return str(recent[0].get("message_id", "")) if recent else ""
-
-    async def _get_target_message_info(self, target_msg_id: str, chat_id: str) -> tuple:
-        """从最近消息里找目标消息的发送者和内容。"""
-        for msg in await self._get_recent_messages(chat_id, limit=20):
-            if str(msg.get("message_id", "")) != target_msg_id:
-                continue
-            info = msg.get("message_info") or {}
-            user = (info.get("user_info") or {}) if isinstance(info, dict) else {}
-            name = str(user.get("user_nickname") or "未知用户")
-            return name, str(msg.get("processed_plain_text") or "")[:120]
-        return "未知用户", ""
 
     # ---- Napcat HTTP（阻塞调用，全部走 to_thread） ----
     async def _napcat_call(
@@ -653,10 +661,37 @@ class GroupEmojiReactPlugin(MaiBotPlugin):
             chance = 0.0
         return random.random() < chance
 
+    def _record_cooldown(self, chat_id: str) -> None:
+        """登记冷却时间；条目超过上限时惰性淘汰（先删过期，仍超则按时间保留最新一批）。
+
+        冷却字典只写不删会随群数/运行时长无界增长，这里把清理压在写入路径上，
+        且只在超过 _MAX_COOLDOWN_ENTRIES 时才扫表，常态零开销。
+        """
+        now = time.time()
+        self._proactive_last_react_at[chat_id] = now
+        if len(self._proactive_last_react_at) <= _MAX_COOLDOWN_ENTRIES:
+            return
+        cutoff = now - max(0, int(self.config.proactive.cooldown_seconds))
+        expired = [k for k, ts in self._proactive_last_react_at.items() if ts < cutoff]
+        for k in expired:
+            del self._proactive_last_react_at[k]
+        if len(self._proactive_last_react_at) > _MAX_COOLDOWN_ENTRIES:
+            keep = sorted(
+                self._proactive_last_react_at.items(), key=lambda kv: kv[1], reverse=True
+            )[:_MAX_COOLDOWN_ENTRIES]
+            self._proactive_last_react_at = dict(keep)
+
     def _remember_message_id(self, message_id: str) -> None:
-        """记录已贴过的消息，避免 hook 与事件监听重复触发。"""
-        if len(self._reacted_message_ids) >= _MAX_TRACKED_MESSAGE_IDS:
-            self._reacted_message_ids.clear()
+        """记录已贴过的消息，避免 hook 与事件监听重复触发。
+
+        滑动窗口：deque(maxlen) 满时自动挤掉最旧 ID，同步从 set 删除，
+        不会像以前那样到顶整体 clear、瞬间失去全部去重保护。
+        """
+        if message_id in self._reacted_message_ids:
+            return
+        if len(self._reacted_message_id_queue) == self._reacted_message_id_queue.maxlen:
+            self._reacted_message_ids.discard(self._reacted_message_id_queue[0])
+        self._reacted_message_id_queue.append(message_id)
         self._reacted_message_ids.add(message_id)
 
     @staticmethod

@@ -31,6 +31,7 @@ class FakeHost:
         self.napcat_calls: list = []
         self.sent_text: list = []
         self.llm_calls: list = []
+        self.get_recent_count = 0  # message.get_recent RPC 次数（验证单次贴表情只拉一次）
 
     def react_calls(self) -> list:
         """只取贴表情调用，排除启动时的 /get_version_info 连通性检测。"""
@@ -49,6 +50,7 @@ class FakeHost:
                 raise RuntimeError("模拟 LLM 服务异常")
             return {"success": True, "response": self.llm_reply}
         if cap == "message.get_recent":
+            self.get_recent_count += 1
             if self.no_recent:
                 return []
             return [
@@ -343,7 +345,8 @@ async def test_decision_label_reflects_fallback() -> bool:
     # 正常 LLM 返回 -> decision=llm
     host2 = FakeHost()
     plugin2 = await make_plugin(host2)
-    prompt2 = await plugin2._build_prompt("555", "小明", "哈哈哈哈", "chat-1")
+    recent2 = await plugin2._get_recent_messages("chat-1", limit=20)
+    prompt2 = plugin2._build_prompt("555", "小明", "哈哈哈哈", recent2[:10])
     _, _, decision_ok = await plugin2._select_emoji(prompt2, fallback_text="哈哈哈哈")
     if decision_ok != "llm":
         print(f"[FAIL] LLM 正常返回时 decision 应为 llm，实际 {decision_ok}")
@@ -353,7 +356,8 @@ async def test_decision_label_reflects_fallback() -> bool:
     host = FakeHost(llm_delay=0.5)
     plugin = await make_plugin(host)
     plugin.config.proactive.llm_timeout_ms = 50
-    prompt = await plugin._build_prompt("555", "小明", "哈哈哈哈", "chat-1")
+    recent = await plugin._get_recent_messages("chat-1", limit=20)
+    prompt = plugin._build_prompt("555", "小明", "哈哈哈哈", recent[:10])
     eid, _, decision = await plugin._select_emoji(prompt, fallback_text="哈哈哈哈")
     if decision != "rule":
         print(f"[FAIL] 超时回退后 decision 应为 rule，实际 {decision}")
@@ -365,7 +369,8 @@ async def test_decision_label_reflects_fallback() -> bool:
     # 非法 ID 在主动路径也应回退（v1.1.2 新增行为）并标 rule
     host3 = FakeHost(llm_reply='{"emoji_id": "99999", "reason": "乱选"}')
     plugin3 = await make_plugin(host3)
-    prompt3 = await plugin3._build_prompt("555", "小明", "哈哈哈哈", "chat-1")
+    recent3 = await plugin3._get_recent_messages("chat-1", limit=20)
+    prompt3 = plugin3._build_prompt("555", "小明", "哈哈哈哈", recent3[:10])
     eid3, _, decision3 = await plugin3._select_emoji(prompt3, fallback_text="哈哈哈哈")
     if decision3 != "rule":
         print(f"[FAIL] 非法 ID 回退后 decision 应为 rule，实际 {decision3}")
@@ -384,6 +389,58 @@ async def test_decision_label_reflects_fallback() -> bool:
         return False
 
     print("[PASS] decision 标签正确：正常=llm，超时回退=rule，非法 ID 回退=rule，关闭回退=失败")
+    return True
+
+
+async def test_react_uses_single_get_recent() -> bool:
+    """v1.2.1 优化：一次贴表情只应调 1 次 message.get_recent RPC。
+
+    旧实现 _get_target_message_info（limit=20）与 _build_prompt（limit=10）各调一次，
+    合并后应为 1 次。若未来有人改回两次查询，本测试应变红。
+    """
+    host = FakeHost()
+    plugin = await make_plugin(host)
+    plugin.config.proactive.chance = 1.0
+    plugin.config.proactive.keyword_chance = 1.0
+    plugin.config.proactive.cooldown_seconds = 0
+    plugin.config.proactive.min_text_length = 1
+
+    await plugin.observe_group_message(message=GROUP_MESSAGE)
+    await asyncio.gather(*list(plugin._tasks))
+
+    if not host.react_calls():
+        print("[FAIL] 前置条件不满足：贴表情未成功，无法统计 get_recent 次数")
+        return False
+    if host.get_recent_count != 1:
+        print(f"[FAIL] 一次贴表情应只调 1 次 get_recent，实际 {host.get_recent_count} 次")
+        return False
+    print(f"[PASS] 单次贴表情仅 1 次 get_recent RPC（合并前为 2 次）: {host.get_recent_count}")
+    return True
+
+
+async def test_reacted_ids_sliding_window() -> bool:
+    """v1.2.1 优化：去重集合到顶后应滑动挤出最旧一条，而不是整体 clear。"""
+    from plugin import _MAX_TRACKED_MESSAGE_IDS
+
+    host = FakeHost()
+    plugin = await make_plugin(host)
+
+    for i in range(_MAX_TRACKED_MESSAGE_IDS + 1):
+        plugin._remember_message_id(f"msg-{i}")
+
+    if "msg-0" in plugin._reacted_message_ids:
+        print("[FAIL] 窗口已满后最旧的 msg-0 应被挤出")
+        return False
+    if f"msg-{_MAX_TRACKED_MESSAGE_IDS}" not in plugin._reacted_message_ids:
+        print("[FAIL] 最新写入的 ID 应在窗口内")
+        return False
+    if "msg-1" not in plugin._reacted_message_ids:
+        print("[FAIL] 滑动窗口只应挤掉最旧一条，msg-1 不应丢失（疑似整体 clear）")
+        return False
+    if len(plugin._reacted_message_ids) != _MAX_TRACKED_MESSAGE_IDS:
+        print(f"[FAIL] 窗口大小应恒为 {_MAX_TRACKED_MESSAGE_IDS}，实际 {len(plugin._reacted_message_ids)}")
+        return False
+    print(f"[PASS] 去重滑动窗口：最旧条目被挤出，其余 {_MAX_TRACKED_MESSAGE_IDS - 1} 条保留")
     return True
 
 
@@ -419,6 +476,8 @@ async def main() -> int:
         test_proactive_llm_error_falls_back,
         test_proactive_timeout_when_target_not_in_recent,
         test_decision_label_reflects_fallback,
+        test_react_uses_single_get_recent,
+        test_reacted_ids_sliding_window,
         test_command_selfcheck,
     ]
     results = []
