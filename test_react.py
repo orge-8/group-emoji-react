@@ -463,6 +463,66 @@ async def test_command_selfcheck() -> bool:
     return True
 
 
+async def test_llm_task_and_model_are_split() -> bool:
+    """llm.generate 的传参：任务名进 task_name、具体模型名进 model（MaiBot 1.2.5 语义拆分）。
+
+    回归防护——旧写法是 generate(prompt, model=<任务名>)。1.2.5 起 model 被解释成
+    「具体模型名」，任务名塞进去会变成「找不到名为 planner 的模型」，整条链路静默失效。
+    详见 runtime-gotchas §47。
+    """
+    host = FakeHost()
+    plugin = await make_plugin(host)
+
+    # 1) 默认配置：任务名只进 task_name，绝不进 model
+    kw = plugin._llm_kwargs()
+    if kw != {"task_name": "planner"}:
+        print(f"[FAIL] 默认配置应只传 task_name=planner，实际 {kw}")
+        return False
+
+    # 2) 只配具体模型名 → 只出 model 键
+    plugin.config.napcat.llm_task = ""
+    plugin.config.napcat.llm_model = "gpt-4o-mini"
+    if plugin._llm_kwargs() != {"model": "gpt-4o-mini"}:
+        print(f"[FAIL] 只配模型名时不应出现 task_name，实际 {plugin._llm_kwargs()}")
+        return False
+
+    # 3) 两者都配 → 各走各的键，不串位
+    plugin.config.napcat.llm_task = "replyer"
+    if plugin._llm_kwargs() != {"task_name": "replyer", "model": "gpt-4o-mini"}:
+        print(f"[FAIL] 两个键应同时存在且互不串位，实际 {plugin._llm_kwargs()}")
+        return False
+
+    # 4) 都留空 → 不传任何键，走 SDK 默认任务 utils
+    plugin.config.napcat.llm_task = ""
+    plugin.config.napcat.llm_model = ""
+    if plugin._llm_kwargs() != {}:
+        print(f"[FAIL] 两者留空时不应传任何键，实际 {plugin._llm_kwargs()}")
+        return False
+
+    # 5) 端到端：真实调用链里 payload 的 task_name 与配置一致，且任务名没漏进 model
+    plugin.config.napcat.llm_task = "planner"
+    plugin.config.proactive.chance = 1.0
+    plugin.config.proactive.keyword_chance = 1.0
+    plugin.config.proactive.cooldown_seconds = 0
+    plugin.config.proactive.min_text_length = 1
+    host.llm_calls.clear()
+    await plugin.observe_group_message(message=GROUP_MESSAGE)
+    await asyncio.gather(*list(plugin._tasks))
+    if not host.llm_calls:
+        print("[FAIL] 端到端未记录到 llm.generate 调用")
+        return False
+    args = host.llm_calls[-1]
+    if args.get("task_name") != "planner" or args.get("model"):
+        print(
+            "[FAIL] 端到端传参不符（任务名不该进 model）: "
+            f"task_name={args.get('task_name')!r} model={args.get('model')!r}"
+        )
+        return False
+
+    print("[PASS] LLM 传参拆分：task_name / model 各走各的键，留空不传（含端到端）")
+    return True
+
+
 async def main() -> int:
     tests = [
         test_hook_reacts_to_group_message,
@@ -479,6 +539,7 @@ async def main() -> int:
         test_react_uses_single_get_recent,
         test_reacted_ids_sliding_window,
         test_command_selfcheck,
+        test_llm_task_and_model_are_split,
     ]
     results = []
     for test in tests:

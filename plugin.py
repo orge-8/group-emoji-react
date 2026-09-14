@@ -89,7 +89,17 @@ class NapcatConfig(PluginConfigBase):
     token: str = Field(default="", description="Napcat HTTP 服务认证 Token（没有就留空）")
     llm_task: str = Field(
         default="planner",
-        description="选表情用的模型任务名或模型标识（planner / replyer / utils / tool_use，也可留空用默认模型）",
+        description=(
+            "选表情用的模型任务名（MaiBot 1.2.5+：model_task_config 的键，如 planner / replyer / utils）；"
+            "留空则不显式指定，走 SDK 默认任务 utils"
+        ),
+    )
+    llm_model: str = Field(
+        default="",
+        description=(
+            "选表情用的具体模型名（可选）。留空则用任务名对应的模型；"
+            "两者语义不同：任务名指向一套配置，模型名指向某个具体模型"
+        ),
     )
     timeout_seconds: int = Field(default=10, description="Napcat 请求超时时间（秒）")
 
@@ -448,6 +458,25 @@ class GroupEmojiReactPlugin(MaiBotPlugin):
         return {"success": False, "content": f"贴表情失败: {detail[:120]}"}
 
     # ---- LLM ----
+    def _llm_kwargs(self) -> dict:
+        """把配置解析成 llm.generate 的 kwargs。
+
+        MaiBot 1.2.5 起「模型任务名」与「具体模型名」是两个参数（见 runtime-gotchas §47）：
+          - 1.2.4- ：generate(model=X) 里 X 按**任务名**解释，任务名与模型名共用同一命名空间
+          - 1.2.5+ ：task_name = 任务名；model / model_name = **具体模型名**
+
+        旧写法把任务名塞进 model=，升级后会变成「找不到名为 planner 的模型」而整条链路失效。
+        这里两个值分开传，各自留空则不传对应键，全空则走 SDK 默认（task_name="utils"）。
+        """
+        kwargs: dict = {}
+        task = str(self.config.napcat.llm_task or "").strip()
+        model = str(self.config.napcat.llm_model or "").strip()
+        if task:
+            kwargs["task_name"] = task
+        if model:
+            kwargs["model"] = model
+        return kwargs
+
     async def _select_emoji(self, prompt: str, fallback_text: str = "") -> tuple:
         """让 LLM 挑一个表情，返回 (emoji_id, emoji_name, decision)。
 
@@ -463,15 +492,11 @@ class GroupEmojiReactPlugin(MaiBotPlugin):
         try:
             if timeout_ms > 0:
                 raw = await asyncio.wait_for(
-                    self.ctx.llm.generate(
-                        prompt, model=str(self.config.napcat.llm_task or "").strip()
-                    ),
+                    self.ctx.llm.generate(prompt, **self._llm_kwargs()),
                     timeout=timeout_ms / 1000.0,
                 )
             else:
-                raw = await self.ctx.llm.generate(
-                    prompt, model=str(self.config.napcat.llm_task or "").strip()
-                )
+                raw = await self.ctx.llm.generate(prompt, **self._llm_kwargs())
         except asyncio.TimeoutError:
             if not use_fallback:
                 return "", f"LLM 调用超时（>{timeout_ms}ms）", ""
@@ -481,7 +506,12 @@ class GroupEmojiReactPlugin(MaiBotPlugin):
             emoji_id, emoji_name = self._select_emoji_by_rule(fallback_text)
             return emoji_id, emoji_name, "rule"
         except Exception as exc:
-            self.ctx.logger.error("调用 LLM 选表情异常: %s", exc)
+            self.ctx.logger.error(
+                "调用 LLM 选表情异常: %s（本次 task_name=%r model=%r）",
+                exc,
+                self.config.napcat.llm_task,
+                self.config.napcat.llm_model,
+            )
             if use_fallback:
                 emoji_id, emoji_name = self._select_emoji_by_rule(fallback_text)
                 return emoji_id, emoji_name, "rule"
