@@ -1,3 +1,12 @@
+# 运行时生成的本地配置（由 Runner 生成，不入库）
 /config.toml
+
+# Python 缓存
 __pycache__/
 *.py[cod]
+
+# 运行时数据目录（插件经 ctx.paths.data_dir 写入）
+data/
+
+# 本地虚拟环境
+.venv/

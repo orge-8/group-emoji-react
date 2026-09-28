@@ -1,17 +1,31 @@
 """MaiBot 群聊贴表情插件。
 
-通过 Napcat 的 set_msg_emoji_like 接口给群聊消息贴表情，由 LLM 决定用哪个表情。
+给群聊消息贴 QQ 表情回应（消息角落的小黄脸），由 LLM 决定用哪个表情。
 两条触发路径：
   1. LLM 主动调用 @Tool("react_emoji")
   2. 普通群聊消息旁路主动贴表情（@HookHandler("chat.receive.after_process")）
 
-踩坑点（详见 maibot-plugin-dev skill 的 runtime-gotchas，改动前请先读）：
+发送通道（transport）：
+  - adapter：走适配器插件的公开 API
+    `adapter.napcat.message.set_msg_emoji_like` / `adapter.snowluma.message.set_msg_emoji_like`
+    （统一 QQ 连接器：github.com/Mai-with-u/MaiBot-SnowLuma-Adapter，两条前缀共享同一处理器）。
+    这是配 SnowLuma 适配器时的正路——插件不需要再单独连一个 Napcat HTTP 服务。
+  - http：直连 Napcat HTTP 服务器（旧行为，需在 Napcat WebUI 开 HTTP 服务器）。
+  - auto（默认）：优先适配器，失败自动回落 HTTP，成功后记住可用路径，下次优先用它。
+
+踩坑点（改动前请先读 maibot-plugin-dev skill 的 runtime-gotchas）：
 - 本文件**不要**写 `from __future__ import annotations`：Runner 用 spec_from_file_location
   加载且不注册进 sys.modules，注解会变成字符串，pydantic 解析配置模型直接失败。
 - 入站消息监听用 **hook 而不要用 EventHandler(EventType.ON_MESSAGE)**：
   部分 MaiBot 版本里 ON_MESSAGE 的派发被注释掉，注册了也永远不会触发。
   可靠的入站入口是 `chat.receive.after_process`（此时 processed_plain_text 已可用）。
 - `http.client` 是阻塞调用，必须丢进 `asyncio.to_thread`，否则会卡住插件 Runner 的事件循环。
+- 表情 ID 与释义必须用 **QQNT emojiId 表**（与适配器 qq_face_map.py 同源）。
+  历史 bug：本插件早期用的是「按序号平移」的旧表，导致 424 续标识被当成「狂按按钮」、
+  233 掐一掐被当成「笑哭」、293 摸锦鲤被当成「敲脑瓜」等——LLM 按错名字挑，
+  用户看到的却是另一个表情。改表时务必核对 QQNT 官方 emojiId。
+- `ctx.llm.generate` **不转发** timeout_ms（SDK 2.8.1 实测），要自定义 RPC 超时
+  必须自己调 `ctx.call_capability("llm.generate", timeout_ms=..., ...)`。
 """
 import asyncio
 import http.client
@@ -37,18 +51,37 @@ except Exception:  # pragma: no cover - 仅旧版 SDK 走这里
     _HOOK_MODE_OBSERVE = "observe"
     _HOOK_ORDER_LATE = "late"
 
-# Napcat 支持的反应表情（ID -> 名称）。ID 必须是 Napcat 认识的，否则接口会拒绝。
+# ---------------------------------------------------------------------------
+# 可用表情表（QQNT emojiId -> 中文名）
+#
+# 数据来源：QQNT 表情表 emojiId（与 MaiBot-SnowLuma-Adapter 的 qq_face_map.py 同源，
+# 该表 1.0.3 起同步自 koishi QFace _index.json）。名称必须与 QQ 端实际渲染的释义
+# 一致，否则 LLM 选择与用户观感会错位——这是本插件最容易静默出错的地方。
+#
+# 只挑群聊里当「回应」用着自然的，不做全表（QQNT 有 500+ 个，全塞给 LLM 反而选不准）。
+# ---------------------------------------------------------------------------
 AVAILABLE_REACT_EMOJIS: dict = {
-    76: "点赞", 307: "喵喵", 285: "摸鱼",
-    66: "爱心", 147: "棒棒糖", 424: "狂按按钮",
-    49: "抱抱", 38: "木槌敲头", 277: "狗头",
-    265: "辣眼睛", 390: "头秃", 63: "玫瑰",
-    212: "托腮", 5: "大哭", 9: "委屈",
-    350: "贴贴", 175: "卖萌", 344: "大怨种",
-    187: "鬼魂", 144: "礼花", 146: "爆筋",
-    311: "打call", 59: "便便", 46: "猪头",
-    37: "骷髅头", 13: "呲牙", 124: "OK",
-    233: "笑哭", 20: "偷笑", 293: "敲脑瓜",
+    76: "赞", 66: "爱心", 63: "玫瑰", 144: "喝彩",
+    13: "呲牙", 20: "偷笑", 182: "笑哭", 5: "流泪",
+    9: "大哭", 106: "委屈", 111: "可怜", 175: "卖萌",
+    187: "幽灵", 212: "托腮", 265: "辣眼睛", 267: "头秃",
+    277: "汪汪", 285: "摸鱼", 307: "喵喵", 311: "打call",
+    323: "嫌弃", 326: "生气", 344: "大怨种", 350: "贴贴",
+    357: "裂开", 380: "真棒", 387: "太好笑", 389: "太赞了",
+    425: "求放过", 428: "收到", 449: "+1", 462: "无语",
+}
+
+# QQNT 表情表的完整释义（仅用于把「适配器回传的表情 ID」翻译成可核对的名称，
+# 以及自检时校验表是否漂移）。这里只收录本插件可能用到的区间，不做全表。
+_QQNT_FACE_NAMES: dict = {
+    5: "流泪", 9: "大哭", 13: "呲牙", 20: "偷笑", 38: "敲打",
+    49: "拥抱", 63: "玫瑰", 66: "爱心", 76: "赞", 106: "委屈",
+    111: "可怜", 144: "喝彩", 175: "卖萌", 182: "笑哭", 187: "幽灵",
+    212: "托腮", 233: "掐一掐", 265: "辣眼睛", 267: "头秃", 277: "汪汪",
+    285: "摸鱼", 293: "摸锦鲤", 307: "喵喵", 311: "打call", 323: "嫌弃",
+    326: "生气", 344: "大怨种", 350: "贴贴", 357: "裂开", 380: "真棒",
+    387: "太好笑", 389: "太赞了", 390: "太头秃", 424: "续标识", 425: "求放过",
+    428: "收到", 449: "+1", 462: "无语",
 }
 
 # 已经确认"明显适合用表情回应"的消息关键词（命中则用更高的概率）
@@ -65,6 +98,28 @@ _MAX_COOLDOWN_ENTRIES = 512
 # prompt 里的表情清单字符串：AVAILABLE_REACT_EMOJIS 是模块级常量，预拼一次复用
 _EMOJI_LIST_PROMPT: str = ", ".join(f"{eid}:{name}" for eid, name in AVAILABLE_REACT_EMOJIS.items())
 
+# ---- 传输通道常量 ----
+_TRANSPORT_AUTO = "auto"
+_TRANSPORT_ADAPTER = "adapter"
+_TRANSPORT_HTTP = "http"
+_TRANSPORTS = (_TRANSPORT_AUTO, _TRANSPORT_ADAPTER, _TRANSPORT_HTTP)
+
+# 适配器（统一 QQ 连接器）暴露的两组等价前缀，按此顺序择一
+_ADAPTER_PREFIXES = ("adapter.napcat", "adapter.snowluma")
+# 贴表情 API 相对前缀的后缀名
+_ADAPTER_REACT_SUFFIX = "message.set_msg_emoji_like"
+# 适配器的无害探针（只读，不产生任何副作用）
+_ADAPTER_PROBE_SUFFIX = "system.get_version_info"
+
+# llm_timeout_ms=0（不限制）时给 RPC 通道的上界：宽松但有限，
+# 避免 cap.call 默认 30s 把「死等」变成「30s 后抛 RPCError」。
+_LLM_RPC_TIMEOUT_NO_LIMIT_MS = 180_000
+# 外层 RPC 超时比内层业务超时宽出的裕量，保证先触发内层 wait_for
+_LLM_RPC_TIMEOUT_SLACK_MS = 2_000
+# 默认模型任务名：utils 是宿主里最轻的一档（flash 级候选），
+# planner 真机单次 25~50s，配在本插件 6s 上限上必然次次超时。
+_DEFAULT_LLM_TASK = "utils"
+
 
 class PluginSectionConfig(PluginConfigBase):
     """插件基础配置。"""
@@ -74,24 +129,42 @@ class PluginSectionConfig(PluginConfigBase):
     __ui_order__ = 0
 
     enabled: bool = Field(default=True, description="是否启用插件")
-    config_version: str = Field(default="1.0.0", description="配置版本")
+    config_version: str = Field(default="1.1.0", description="配置版本")
 
 
 class NapcatConfig(PluginConfigBase):
-    """Napcat 服务连接配置。"""
+    """连接与模型配置。
 
-    __ui_label__ = "Napcat 服务"
+    配置节名沿用 `napcat`（避免升级时丢用户已有配置），但实际含义是「发送通道 + 选表情模型」：
+    走适配器时 host/port/token 全部用不到。
+    """
+
+    __ui_label__ = "连接与模型"
     __ui_icon__ = "server"
     __ui_order__ = 1
 
-    host: str = Field(default="127.0.0.1", description="Napcat HTTP 服务地址（Docker 部署一般填容器名，如 napcat）")
-    port: int = Field(default=9999, description="Napcat HTTP 服务端口")
-    token: str = Field(default="", description="Napcat HTTP 服务认证 Token（没有就留空）")
+    transport: str = Field(
+        default=_TRANSPORT_AUTO,
+        description=(
+            "发送通道：auto=优先适配器、失败回落 HTTP（推荐）；"
+            "adapter=只走适配器插件的公开 API（SnowLuma / NapCat 统一连接器）；"
+            "http=只直连 Napcat HTTP 服务器。改这项需重启 MaiBot"
+        ),
+    )
+    host: str = Field(
+        default="127.0.0.1",
+        description="仅 transport=http/auto 用到：Napcat HTTP 服务地址（Docker 部署一般填容器名，如 napcat）",
+    )
+    port: int = Field(default=9999, description="仅 transport=http/auto 用到：Napcat HTTP 服务端口")
+    token: str = Field(
+        default="", description="仅 transport=http/auto 用到：Napcat HTTP 服务认证 Token（没有就留空）"
+    )
     llm_task: str = Field(
-        default="planner",
+        default=_DEFAULT_LLM_TASK,
         description=(
             "选表情用的模型任务名（MaiBot 1.2.5+：model_task_config 的键，如 planner / replyer / utils）；"
-            "留空则不显式指定，走 SDK 默认任务 utils"
+            "留空则不显式指定，走 SDK 默认任务 utils。建议用 utils —— planner 通常是大模型，单次 20s+，"
+            "会一直撞 proactive.llm_timeout_ms"
         ),
     )
     llm_model: str = Field(
@@ -101,7 +174,7 @@ class NapcatConfig(PluginConfigBase):
             "两者语义不同：任务名指向一套配置，模型名指向某个具体模型"
         ),
     )
-    timeout_seconds: int = Field(default=10, description="Napcat 请求超时时间（秒）")
+    timeout_seconds: int = Field(default=10, description="仅 HTTP 通道：单次 Napcat 请求超时时间（秒）")
 
 
 class ProactiveConfig(PluginConfigBase):
@@ -164,6 +237,43 @@ def _relative_time(ts: Any) -> str:
     return f"{int(diff // 86400)}天前"
 
 
+def _excerpt(value: Any, limit: int = 160) -> str:
+    """把任意返回值压成一行短文本，用于日志与自检（永不抛出）。"""
+    try:
+        if isinstance(value, (dict, list, tuple)):
+            text = json.dumps(value, ensure_ascii=False, default=str)
+        else:
+            text = str(value)
+    except Exception:
+        text = f"<{type(value).__name__} 无法序列化>"
+    text = text.replace("\n", " ").replace("\r", " ")
+    return text if len(text) <= limit else text[:limit] + "…"
+
+
+def _is_timeout(exc: BaseException) -> bool:
+    """判断异常是不是超时。
+
+    不能只用 isinstance(asyncio.TimeoutError)：真机上 cap.call 超时抛的是 Runner 的
+    RPCError（msgpack 重建的类，与本地测试里的不是同一个对象，且 `from None` 掐掉了
+    __cause__），只用 isinstance 会漏判、把它当成「选表情异常」，把排查方向带偏。
+    所以三取一：isinstance / 类名含 timeout / 文本命中任一超时标记。
+
+    文本标记必须同时覆盖：
+      - "timeout"   —— [E_TIMEOUT] 请求 cap.call 超时 (180000ms)
+      - "timed out" —— Request timed out.（不含 "timeout" 子串，只写 "timeout" 会漏判）
+      - "超时"       —— 中文回退链路
+    """
+    if isinstance(exc, (asyncio.TimeoutError, TimeoutError)):
+        return True
+    if "timeout" in type(exc).__name__.lower():
+        return True
+    text = str(exc).lower()
+    return any(
+        marker in text
+        for marker in ("timeout", "timed out", "超时")
+    )
+
+
 class GroupEmojiReactPlugin(MaiBotPlugin):
     """群聊贴表情插件。"""
 
@@ -185,15 +295,24 @@ class GroupEmojiReactPlugin(MaiBotPlugin):
         self._reacted_message_ids: set = set()
         self._reacted_message_id_queue: deque = deque(maxlen=_MAX_TRACKED_MESSAGE_IDS)
         self._tasks: set = set()
+        # 适配器通道状态
+        self._adapter_prefix: str = ""          # "" = 尚未解析
+        self._adapter_probed: bool = False      # 是否已经解析过一次（哪怕结果是"不可用"）
+        self._adapter_list_seen: bool = False   # api.list() 是否给出过结果（给出过则前缀结论权威）
+        self._adapter_last_error: str = ""      # 最近一次适配器通道的失败原因（自检用）
+        # auto 模式下上一次成功的通道，下次优先用它，避免每次都先踩一次失败
+        self._react_transport_used: str = ""
 
     async def on_load(self) -> None:
         """插件加载时执行。"""
         self.ctx.logger.info(
-            "群聊贴表情插件已加载: napcat=%s:%s",
+            "群聊贴表情插件已加载: transport=%s, napcat=%s:%s, llm_task=%r",
+            self.config.napcat.transport,
             self.config.napcat.host,
             self.config.napcat.port,
+            self.config.napcat.llm_task,
         )
-        self._spawn(self._check_napcat_connection())
+        self._spawn(self._check_channel())
 
     async def on_unload(self) -> None:
         """插件卸载时执行：取消所有未完成的后台任务。"""
@@ -209,15 +328,21 @@ class GroupEmojiReactPlugin(MaiBotPlugin):
 
     async def on_config_update(self, scope: str, config_data: dict, version: str) -> None:
         """配置热重载时执行。"""
-        if scope == "self":
-            self.ctx.logger.info("群聊贴表情: 配置已更新 version=%s", version)
+        if scope != "self":
+            return
+        # 通道相关配置变了就得重新探测，否则会一直用旧结论
+        self._adapter_prefix = ""
+        self._adapter_probed = False
+        self._adapter_list_seen = False
+        self._react_transport_used = ""
+        self.ctx.logger.info("群聊贴表情: 配置已更新 version=%s（通道已重置，将重新探测）", version)
 
     # ------------------------------------------------------------------
     # HookHandler: 普通群聊消息旁路主动贴表情（不拦截正常回复流程）
     # ------------------------------------------------------------------
     @HookHandler(
         "chat.receive.after_process",
-        name="emoji_react_observer",
+        name="observe_group_message",
         description="群聊消息处理后旁路判断是否贴表情，不拦截正常回复流程",
         mode=_HOOK_MODE_OBSERVE,
         order=_HOOK_ORDER_LATE,
@@ -324,29 +449,19 @@ class GroupEmojiReactPlugin(MaiBotPlugin):
     # ------------------------------------------------------------------
     @Command(
         "reacttest",
-        description="检查贴表情插件与 Napcat 的连通性",
+        description="检查贴表情插件的发送通道与模型配置",
         pattern=r"^\s*[/／]\s*(?:表情测试|贴表情测试|reacttest)\s*$",
         aliases=["表情测试"],
     )
     async def cmd_reacttest(self, **kwargs: Any) -> tuple:
-        """自检命令：报告 Napcat 连通性与当前生效配置（不回显 Token）。"""
+        """自检命令：报告发送通道可用性、表情表一致性与当前生效配置（不回显 Token）。"""
         stream_id = ""
         for key in ("stream_id", "chat_id", "session_id", "stream"):
             if kwargs.get(key):
                 stream_id = str(kwargs[key])
                 break
 
-        host = self.config.napcat.host
-        port = self.config.napcat.port
-        ok, _, detail = await self._napcat_call("GET", "/get_version_info", None)
-
-        if ok:
-            text = f"贴表情插件正常：已连上 Napcat {host}:{port}"
-        else:
-            text = (
-                f"贴表情插件：连不上 Napcat {host}:{port}（{detail[:120]}）。"
-                "请检查 Napcat 是否启动、WebUI 里是否配置了 HTTP 服务器，以及 config.toml 的 host/port 是否正确。"
-            )
+        text = await self._build_selfcheck_text()
 
         sent = False
         if stream_id:
@@ -361,7 +476,223 @@ class GroupEmojiReactPlugin(MaiBotPlugin):
         return True, text, 2 if sent else 0
 
     # ------------------------------------------------------------------
-    # 内部实现
+    # 内部实现：发送通道
+    # ------------------------------------------------------------------
+    def _configured_transport(self) -> str:
+        """读取并归一化 transport 配置。"""
+        raw = str(getattr(self.config.napcat, "transport", _TRANSPORT_AUTO) or "").strip().lower()
+        return raw if raw in _TRANSPORTS else _TRANSPORT_AUTO
+
+    def _transport_order(self) -> list:
+        """本次要尝试的通道顺序。auto 会把上次成功的那条排到最前面。"""
+        configured = self._configured_transport()
+        if configured == _TRANSPORT_ADAPTER:
+            return [_TRANSPORT_ADAPTER]
+        if configured == _TRANSPORT_HTTP:
+            return [_TRANSPORT_HTTP]
+        order = [_TRANSPORT_ADAPTER, _TRANSPORT_HTTP]
+        if self._react_transport_used in order:
+            order.remove(self._react_transport_used)
+            order.insert(0, self._react_transport_used)
+        return order
+
+    async def _ensure_adapter_prefix(self, force: bool = False) -> str:
+        """解析可用的适配器 API 前缀，返回 "" 表示适配器通道不可用。
+
+        优先用一次只读的 `ctx.api.list()` 拿到全部可见 API 名（无副作用、无报错噪音）；
+        list 不可用时才用 `system.get_version_info` 逐前缀试探。
+        结论会缓存——`adapter.napcat.*` 与 `adapter.snowluma.*` 共享处理器，
+        解析一次就够，不必每次贴表情都探。
+        """
+        if self._adapter_prefix:
+            return self._adapter_prefix
+        if self._adapter_probed and not force:
+            return ""
+
+        api = getattr(self.ctx, "api", None)
+        if api is None or not callable(getattr(api, "call", None)):
+            self._adapter_probed = True
+            self._adapter_last_error = "当前 SDK 未提供 ctx.api.call，无法走适配器通道"
+            return ""
+
+        names = await self._list_visible_api_names()
+        if names:
+            self._adapter_list_seen = True
+            for prefix in _ADAPTER_PREFIXES:
+                if f"{prefix}.{_ADAPTER_REACT_SUFFIX}" in names:
+                    self._adapter_prefix = prefix
+                    self._adapter_last_error = ""
+                    self.ctx.logger.info("适配器通道就绪: %s.%s", prefix, _ADAPTER_REACT_SUFFIX)
+                    return prefix
+            self._adapter_probed = True
+            self._adapter_last_error = (
+                f"已列出 {len(names)} 个插件 API，但没有适配器的 {_ADAPTER_REACT_SUFFIX}；"
+                "请确认装的是统一 QQ 连接器适配器（MaiBot-SnowLuma-Adapter）"
+            )
+            return ""
+
+        # api.list() 拿不到东西，退回逐前缀试探
+        for prefix in _ADAPTER_PREFIXES:
+            if await self._probe_adapter_prefix(prefix):
+                self._adapter_prefix = prefix
+                self._adapter_last_error = ""
+                self.ctx.logger.info("适配器通道就绪（探针命中）: %s", prefix)
+                return prefix
+        self._adapter_probed = True
+        self._adapter_last_error = (
+            "api.list() 无结果，且 adapter.napcat / adapter.snowluma 探针均失败；"
+            "请确认 QQ 适配器插件已加载"
+        )
+        return ""
+
+    async def _list_visible_api_names(self) -> list:
+        """调一次 ctx.api.list()，把返回结构里能当名字用的字符串全捞出来。"""
+        api = getattr(self.ctx, "api", None)
+        if not callable(getattr(api, "list", None)):
+            return []
+        try:
+            # 这里刻意写成字面量 self.ctx.api.list()：静态门禁靠正则扫描
+            # `self.ctx.<dotted>(` 来核对 manifest 能力声明，经 getattr 间接调用会被
+            # 判成「声明了但未用到」，白吃一条 WARN。守卫用 getattr(...,None) 做，不影响兼容性。
+            listed = await self.ctx.api.list()
+        except Exception as exc:
+            self.ctx.logger.debug("ctx.api.list 探测失败: %s", exc)
+            return []
+        return self._collect_strings(listed)
+
+    async def _probe_adapter_prefix(self, prefix: str) -> bool:
+        """用无害的 get_version_info 探针验证某组前缀是否可用。"""
+        ok, _, _ = await self._call_adapter_api(f"{prefix}.{_ADAPTER_PROBE_SUFFIX}")
+        return ok
+
+    async def _call_adapter_api(self, api_name: str, **kwargs: Any) -> tuple:
+        """调用适配器公开 API，返回 (是否业务成功, 原始返回, 详情文本)。
+
+        适配器这些动作型 API 的返回就是 OneBot v11 原始响应（status/retcode/data），
+        success 判定沿用 HTTP 通道那套。
+        """
+        api = getattr(self.ctx, "api", None)
+        if not callable(getattr(api, "call", None)):
+            return False, None, "当前 SDK 未提供 ctx.api.call"
+        # version="1" 是适配器的注册版本；个别宿主对 version 参数处理不同，失败再退回不带 version。
+        # 同理写成字面量 self.ctx.api.call(...)，让静态门禁能核对 api.call 已声明。
+        detail = f"{api_name} 调用异常: SDK 未提供 ctx.api.call"
+        for version in ("1", ""):
+            try:
+                if version:
+                    result = await self.ctx.api.call(api_name, version=version, **kwargs)
+                else:
+                    result = await self.ctx.api.call(api_name, **kwargs)
+            except Exception as exc:
+                detail = f"{api_name} 调用异常: {type(exc).__name__}: {exc}"
+                continue
+            if self._payload_ok(result):
+                return True, result, f"{api_name} -> {_excerpt(result)}"
+            return False, result, f"{api_name} 返回失败: {_excerpt(result)}"
+        return False, None, detail
+
+    async def _apply_emoji_like(self, message_id: str, emoji_id: int) -> tuple:
+        """按 transport 顺序贴表情，返回 (是否成功, 详情文本)。"""
+        attempts = []
+        for channel in self._transport_order():
+            if channel == _TRANSPORT_ADAPTER:
+                ok, detail = await self._apply_via_adapter(message_id, emoji_id)
+            else:
+                ok, detail = await self._apply_via_http(message_id, emoji_id)
+            if ok:
+                self._react_transport_used = channel
+                return True, detail
+            attempts.append(detail)
+            self.ctx.logger.debug("贴表情通道 %s 失败: %s", channel, detail)
+        return False, " | ".join(attempts)
+
+    async def _apply_via_adapter(self, message_id: str, emoji_id: int) -> tuple:
+        """经适配器插件公开 API 贴表情。"""
+        prefix = await self._ensure_adapter_prefix()
+        if not prefix:
+            return False, self._adapter_last_error or "适配器通道不可用"
+        ok, _, detail = await self._call_adapter_api(
+            f"{prefix}.{_ADAPTER_REACT_SUFFIX}",
+            message_id=message_id,
+            emoji_id=int(emoji_id),
+            set=True,
+        )
+        if not ok:
+            self._adapter_last_error = detail
+        return ok, detail
+
+    async def _apply_via_http(self, message_id: str, emoji_id: int) -> tuple:
+        """直连 Napcat HTTP 贴表情。"""
+        ok, _, detail = await self._napcat_call(
+            "POST",
+            "/set_msg_emoji_like",
+            {"message_id": message_id, "emoji_id": emoji_id, "set": True},
+        )
+        return ok, detail
+
+    async def _check_channel(self) -> None:
+        """启动时探测可用通道并记日志（不回显 Token）。"""
+        mode = self._configured_transport()
+        if mode in (_TRANSPORT_AUTO, _TRANSPORT_ADAPTER):
+            prefix = await self._ensure_adapter_prefix()
+            if prefix:
+                self.ctx.logger.info("发送通道: 适配器可用（%s）", prefix)
+            elif mode == _TRANSPORT_ADAPTER:
+                self.ctx.logger.warning("发送通道: 适配器不可用 -> %s", self._adapter_last_error)
+            else:
+                self.ctx.logger.debug("发送通道: 适配器不可用 -> %s", self._adapter_last_error)
+
+        if mode in (_TRANSPORT_AUTO, _TRANSPORT_HTTP):
+            ok, _, detail = await self._napcat_call("GET", "/get_version_info", None)
+            host, port = self.config.napcat.host, self.config.napcat.port
+            if ok:
+                self.ctx.logger.info("发送通道: Napcat HTTP 可用（%s:%s）", host, port)
+            elif mode == _TRANSPORT_HTTP:
+                self.ctx.logger.warning(
+                    "发送通道: 连不上 Napcat HTTP %s:%s -> %s。"
+                    "若你在用统一 QQ 连接器适配器，把 napcat.transport 改成 adapter 或 auto 即可，无需 HTTP 服务器",
+                    host, port, detail[:200],
+                )
+            else:
+                self.ctx.logger.debug("发送通道: Napcat HTTP 不可用（%s:%s）", host, port)
+
+    async def _build_selfcheck_text(self) -> str:
+        """拼自检文案：发送通道 + 模型配置 + 表情表状态。"""
+        lines = ["贴表情插件自检"]
+        mode = self._configured_transport()
+        lines.append(f"传输方式配置：{mode}")
+
+        if mode in (_TRANSPORT_AUTO, _TRANSPORT_ADAPTER):
+            prefix = await self._ensure_adapter_prefix(force=True)
+            if prefix:
+                lines.append(f"适配器通道：可用（{prefix}）")
+            else:
+                lines.append(f"适配器通道：不可用（{self._adapter_last_error}）")
+
+        if mode in (_TRANSPORT_AUTO, _TRANSPORT_HTTP):
+            ok, _, detail = await self._napcat_call("GET", "/get_version_info", None)
+            host, port = self.config.napcat.host, self.config.napcat.port
+            if ok:
+                lines.append(f"Napcat HTTP：可用（{host}:{port}）")
+            else:
+                lines.append(f"Napcat HTTP：不可用（{host}:{port}，{detail[:80]}）")
+
+        if self._react_transport_used:
+            lines.append(f"最近成功通道：{self._react_transport_used}")
+
+        task = str(self.config.napcat.llm_task or "").strip() or _DEFAULT_LLM_TASK
+        model = str(self.config.napcat.llm_model or "").strip()
+        lines.append(f"选表情模型：task_name={task}" + (f"，model={model}" if model else ""))
+        lines.append(
+            f"主动贴表情：{'开' if self.config.proactive.enabled else '关'}"
+            f"（LLM 超时 {self.config.proactive.llm_timeout_ms}ms，"
+            f"失败{'回退关键词规则' if self.config.proactive.rule_fallback else '直接跳过'}）"
+        )
+        lines.append(f"内置表情：{len(AVAILABLE_REACT_EMOJIS)} 个（QQNT emojiId 表）")
+        return "\n".join(lines)
+
+    # ------------------------------------------------------------------
+    # 内部实现：贴表情主链路
     # ------------------------------------------------------------------
     def _spawn(self, coro: Any) -> None:
         """起一个可追踪的后台任务，on_unload 时统一取消。"""
@@ -400,7 +731,7 @@ class GroupEmojiReactPlugin(MaiBotPlugin):
         source: str,
         fallback_text: str = "",
     ) -> dict:
-        """对指定消息贴表情：取上下文 -> LLM 选表情 -> 调 Napcat。
+        """对指定消息贴表情：取上下文 -> LLM 选表情 -> 按通道发出。
 
         选表情策略（LLM 是唯一选表情路径）：
         - 主动路径（source=proactive）：调 LLM（带 llm_timeout_ms 超时）。
@@ -440,22 +771,19 @@ class GroupEmojiReactPlugin(MaiBotPlugin):
         if not emoji_id:
             return {"success": False, "content": f"选表情失败: {emoji_name}"}
 
-        ok, _, detail = await self._napcat_call(
-            "POST",
-            "/set_msg_emoji_like",
-            {"message_id": target_msg_id, "emoji_id": emoji_id, "set": True},
-        )
+        ok, detail = await self._apply_emoji_like(target_msg_id, int(emoji_id))
         if ok:
             self.ctx.logger.info(
-                "贴表情成功: source=%s, decision=%s, 消息=%s, 表情=%s(%s)",
-                source, decision, target_msg_id, emoji_id, emoji_name
+                "贴表情成功: source=%s, decision=%s, 通道=%s, 消息=%s, 表情=%s(%s)",
+                source, decision, self._react_transport_used or self._configured_transport(),
+                target_msg_id, emoji_id, emoji_name,
             )
             return {
                 "success": True,
                 "content": f"已对 {user_name} 的消息贴了「{emoji_name}」表情",
             }
         self.ctx.logger.warning("贴表情失败: 消息=%s, 原因=%s", target_msg_id, detail)
-        return {"success": False, "content": f"贴表情失败: {detail[:120]}"}
+        return {"success": False, "content": f"贴表情失败: {detail[:160]}"}
 
     # ---- LLM ----
     def _llm_kwargs(self) -> dict:
@@ -477,6 +805,38 @@ class GroupEmojiReactPlugin(MaiBotPlugin):
             kwargs["model"] = model
         return kwargs
 
+    async def _llm_generate(self, prompt: str) -> Any:
+        """按 llm_timeout_ms 决定双层超时后调用 llm.generate。
+
+        两层必须分开理解（别把外层当成内层用）：
+        - 内层 asyncio.wait_for：我们要的「业务超时」，到点按 rule_fallback 决定回退/跳过；
+        - 外层 RPC timeout_ms：cap.call 通道超时，SDK 默认只有 30s。外层一旦先断，
+          抛的是 RPC 的 E_TIMEOUT（不是 asyncio.TimeoutError），会被误判成「选表情异常」，
+          把「模型慢」错报成「代码错」。
+
+        所以外层恒比内层宽 2s；llm_timeout_ms=0（不限制）时也给一个宽松但有限的上界，
+        否则「不限制」会被 cap.call 的 30s 默认值悄悄变成「30s 限制」。
+        """
+        kwargs = self._llm_kwargs()
+        # 与 SDK LLMCapability.generate 的载荷保持一致：prompt / model / task_name 恒有
+        payload = {
+            "prompt": prompt,
+            "model": str(kwargs.get("model", "") or ""),
+            "task_name": str(kwargs.get("task_name", "") or _DEFAULT_LLM_TASK),
+        }
+        timeout_ms = int(self.config.proactive.llm_timeout_ms or 0)
+        rpc_timeout = timeout_ms + _LLM_RPC_TIMEOUT_SLACK_MS if timeout_ms > 0 else _LLM_RPC_TIMEOUT_NO_LIMIT_MS
+
+        call_capability = getattr(self.ctx, "call_capability", None)
+        if callable(call_capability):
+            coro = call_capability("llm.generate", timeout_ms=rpc_timeout, **payload)
+        else:  # pragma: no cover - 老 SDK 兜底
+            coro = self.ctx.llm.generate(prompt, **kwargs)
+
+        if timeout_ms <= 0:
+            return await coro
+        return await asyncio.wait_for(coro, timeout=timeout_ms / 1000.0)
+
     async def _select_emoji(self, prompt: str, fallback_text: str = "") -> tuple:
         """让 LLM 挑一个表情，返回 (emoji_id, emoji_name, decision)。
 
@@ -490,24 +850,19 @@ class GroupEmojiReactPlugin(MaiBotPlugin):
         use_fallback = bool(fallback_text)
         timeout_ms = int(self.config.proactive.llm_timeout_ms or 0)
         try:
-            if timeout_ms > 0:
-                raw = await asyncio.wait_for(
-                    self.ctx.llm.generate(prompt, **self._llm_kwargs()),
-                    timeout=timeout_ms / 1000.0,
-                )
-            else:
-                raw = await self.ctx.llm.generate(prompt, **self._llm_kwargs())
-        except asyncio.TimeoutError:
-            if not use_fallback:
-                return "", f"LLM 调用超时（>{timeout_ms}ms）", ""
-            self.ctx.logger.warning(
-                "LLM 选表情超时（>%dms），回退到关键词规则", timeout_ms
-            )
-            emoji_id, emoji_name = self._select_emoji_by_rule(fallback_text)
-            return emoji_id, emoji_name, "rule"
+            raw = await self._llm_generate(prompt)
         except Exception as exc:
+            if _is_timeout(exc):
+                if not use_fallback:
+                    return "", f"LLM 调用超时（>{timeout_ms}ms）", ""
+                self.ctx.logger.warning(
+                    "LLM 选表情超时（>%dms，%s），回退到关键词规则", timeout_ms, type(exc).__name__
+                )
+                emoji_id, emoji_name = self._select_emoji_by_rule(fallback_text)
+                return emoji_id, emoji_name, "rule"
             self.ctx.logger.error(
-                "调用 LLM 选表情异常: %s（本次 task_name=%r model=%r）",
+                "调用 LLM 选表情异常: %s: %s（本次 task_name=%r model=%r）",
+                type(exc).__name__,
                 exc,
                 self.config.napcat.llm_task,
                 self.config.napcat.llm_model,
@@ -546,16 +901,19 @@ class GroupEmojiReactPlugin(MaiBotPlugin):
             return "", f"解析 LLM 结果失败: {exc}", ""
 
     # 关键词 -> 候选表情 ID。命中关键词后从对应候选池随机挑一个。
+    # 候选 ID 必须落在 AVAILABLE_REACT_EMOJIS 内，且释义以 QQNT 表为准。
     _RULE_EMOJI_MAP: dict = {
-        ("哈哈", "笑死", "233", "www", "绷不住"): (233, 20, 13),        # 笑哭/偷笑/呲牙
-        ("好耶", "牛", "厉害", "恭喜", "666"): (124, 311, 66),          # OK/打call/爱心
-        ("可爱", "贴贴", "抱抱", "么么"): (350, 175, 49),               # 贴贴/卖萌/抱抱
-        ("哭", "难过", "救命", "呜呜", "orz"): (5, 9, 212),             # 大哭/委屈/托腮
-        ("？", "?", "离谱", "草", "无语"): (293, 265, 187),             # 敲脑瓜/辣眼睛/鬼魂
-        ("谢谢", "玫瑰"): (63, 66),                                     # 玫瑰/爱心
+        ("哈哈", "笑死", "233", "www", "绷不住", "太好笑"): (182, 20, 13),   # 笑哭/偷笑/呲牙
+        ("好耶", "牛", "厉害", "恭喜", "666", "赞"): (76, 311, 144),        # 赞/打call/喝彩
+        ("可爱", "贴贴", "抱抱", "么么", "萌"): (350, 175, 66),             # 贴贴/卖萌/爱心
+        ("哭", "难过", "救命", "呜呜", "orz", "惨"): (9, 5, 106),           # 大哭/流泪/委屈
+        ("？", "?", "离谱", "草", "无语", "什么"): (462, 265, 187),         # 无语/辣眼睛/幽灵
+        ("谢谢", "感谢", "玫瑰", "爱你"): (63, 66, 144),                    # 玫瑰/爱心/喝彩
+        ("生气", "气死", "烦", "讨厌"): (326, 323, 462),                    # 生气/嫌弃/无语
+        ("求", "放过", "饶命"): (425, 111, 428),                            # 求放过/可怜/收到
     }
     # 无关键词命中时的兜底候选池（群聊里比较百搭的几个）
-    _RULE_DEFAULT_EMOJIS: tuple = (124, 233, 13, 66)
+    _RULE_DEFAULT_EMOJIS: tuple = (76, 66, 182, 13)
 
     def _select_emoji_by_rule(self, text: str) -> tuple:
         """关键词规则选表情：毫秒级返回，不依赖 LLM。返回 (emoji_id, emoji_name)。"""
@@ -640,7 +998,9 @@ class GroupEmojiReactPlugin(MaiBotPlugin):
             conn = http.client.HTTPConnection(host, port, timeout=timeout)
             headers = {"Content-Type": "application/json"}
             if token:
-                headers["Authorization"] = token
+                # OneBot v11 标准写法是 Authorization: Bearer <token>；
+                # 早前这里直接塞原始 token，Napcat 配了 token 时会一律 401。
+                headers["Authorization"] = token if token.lower().startswith("bearer ") else f"Bearer {token}"
             body = json.dumps(payload) if payload is not None else None
             conn.request(method, path, body=body, headers=headers)
             resp = conn.getresponse()
@@ -649,8 +1009,7 @@ class GroupEmojiReactPlugin(MaiBotPlugin):
                 data = json.loads(raw)
             except json.JSONDecodeError:
                 return False, None, f"响应不是 JSON（HTTP {resp.status}）: {raw[:200]}"
-            ok = data.get("status") == "ok" or data.get("retcode") == 0
-            return ok, data, str(data.get("message") or data.get("wording") or raw)[:300]
+            return self._payload_ok(data), data, self._payload_detail(data, raw)
         except Exception as exc:
             return False, None, f"{type(exc).__name__}: {exc}"
         finally:
@@ -660,19 +1019,43 @@ class GroupEmojiReactPlugin(MaiBotPlugin):
                 except Exception:
                     pass
 
-    async def _check_napcat_connection(self) -> None:
-        """启动时检测 Napcat 连通性并记日志（不回显 Token）。"""
-        ok, _, detail = await self._napcat_call("GET", "/get_version_info", None)
-        host, port = self.config.napcat.host, self.config.napcat.port
-        if ok:
-            self.ctx.logger.info("Napcat 连通性检测通过: %s:%s", host, port)
-        else:
-            self.ctx.logger.warning(
-                "Napcat 连通性检测失败: %s:%s -> %s（不影响插件加载，但贴表情会失败）",
-                host, port, detail[:200],
-            )
-
     # ---- 判断与提取 ----
+    @staticmethod
+    def _payload_ok(result: Any) -> bool:
+        """判定 OneBot v11 响应是否成功（HTTP 与适配器通道共用同一判据）。"""
+        if not isinstance(result, dict):
+            return False
+        if result.get("status") == "ok" or result.get("retcode") == 0:
+            return True
+        return False
+
+    @staticmethod
+    def _payload_detail(result: Any, raw: str = "") -> str:
+        """从 OneBot 响应里取一句可读详情（优先 message/wording，退化到原文）。"""
+        if isinstance(result, dict):
+            text = result.get("message") or result.get("wording") or result.get("msg")
+            if text:
+                return str(text)[:300]
+        return str(raw or result)[:300]
+
+    @staticmethod
+    def _collect_strings(node: Any) -> list:
+        """递归收集结构里所有字符串值（用于解析 ctx.api.list() 的返回）。"""
+        found: list = []
+
+        def walk(current: Any) -> None:
+            if isinstance(current, str):
+                found.append(current)
+            elif isinstance(current, dict):
+                for value in current.values():
+                    walk(value)
+            elif isinstance(current, (list, tuple, set)):
+                for item in current:
+                    walk(item)
+
+        walk(node)
+        return found
+
     def _should_try_proactive(self, chat_id: str, message_id: str, content: str) -> bool:
         """按去重、冷却、概率判断是否主动贴表情。"""
         if message_id in self._reacted_message_ids:

@@ -1,18 +1,31 @@
 # 复制为 config.toml 后按需修改。config.toml 不入库（见 .gitignore）。
 [plugin]
 enabled = true
-config_version = "1.0.0"
+config_version = "1.1.0"
 
 [napcat]
+# 发送通道：
+#   auto（推荐）    = 优先走 QQ 适配器插件的公开 API，失败自动回落 Napcat HTTP，成功后记住可用路径
+#   adapter         = 只走适配器（SnowLuma / NapCat 统一连接器，插件 ID 里带 adapter 的那个）
+#   http            = 只直连 Napcat HTTP 服务器（旧行为，需要自己在 Napcat WebUI 开 HTTP 服务器）
+# 用统一适配器时选 auto 或 adapter，下面的 host/port/token 就都不需要了。改这项需重启 MaiBot。
+transport = "auto"
+
+# 以下三项仅 transport = "http" / "auto" 时用到
 # Napcat HTTP 服务地址：本机部署填 127.0.0.1，Docker 部署一般填容器名（如 napcat）
 host = "127.0.0.1"
 # Napcat WebUI -> 网络配置 -> 添加 HTTP 服务器 里填的端口
 port = 9999
-# Napcat HTTP 服务的认证 Token，没设置就留空
+# Napcat HTTP 服务的认证 Token，没设置就留空（会以 Authorization: Bearer 发出）
 token = ""
-# 选表情用的模型任务名（planner / replyer / utils / tool_use），也可留空用默认模型
-llm_task = "planner"
-# 单次 Napcat 请求超时（秒）
+
+# 选表情用的模型任务名（planner / replyer / utils / tool_use），也可留空用默认模型。
+# 建议保持 utils：planner 一般绑的是大模型，真机单次 20~50s，会一直撞 proactive.llm_timeout_ms。
+llm_task = "utils"
+# 具体模型名（可选）。留空表示用任务名的模型选择策略。
+llm_model = ""
+
+# 单次 Napcat 请求超时（秒），仅 HTTP 通信用
 timeout_seconds = 10
 
 [proactive]
@@ -30,8 +43,8 @@ min_text_length = 2
 skip_self_messages = true
 # LLM 选表情失败（超时/异常/返回非法）时是否回退到内置关键词规则。
 # false（默认）：直接跳过本次贴表情，宁缺毋滥，不贴不合语境的表情
-# true：回退关键词规则，保证贴得上但选得比较粗（真机实测延迟 ~6s 内）
+# true：回退关键词规则，保证贴得上但选得比较粗
 rule_fallback = false
 # 主动路径 LLM 选表情的超时（毫秒），超时按 rule_fallback 决定回退或跳过
-# 0 = 不限制（死等 LLM）；真机日志里 LLM 耗时 19.4s，默认 6000ms 能兜住大部分慢模型场景
+# 0 = 不限制（但 RPC 通道仍有 180s 上界，避免 cap.call 默认 30s 把"死等"变成"30s 后报错"）
 llm_timeout_ms = 6000
