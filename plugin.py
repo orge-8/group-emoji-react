@@ -98,6 +98,34 @@ _MAX_COOLDOWN_ENTRIES = 512
 # prompt 里的表情清单字符串：AVAILABLE_REACT_EMOJIS 是模块级常量，预拼一次复用
 _EMOJI_LIST_PROMPT: str = ", ".join(f"{eid}:{name}" for eid, name in AVAILABLE_REACT_EMOJIS.items())
 
+# ---------------------------------------------------------------------------
+# 上下文判断常量
+# ---------------------------------------------------------------------------
+# 上下文窗口默认大小：目标消息「之前」取多少条 / 「之后」取多少条。
+# 之前取多、之后取少：语气、话题、梗都在前文里；而目标消息通常是刚入站的，后面还没人接话。
+_DEFAULT_CONTEXT_BEFORE = 6
+_DEFAULT_CONTEXT_AFTER = 2
+# 上下文消息与目标消息的时间差上限（秒）：超了就认为是另一个话题，不纳入上下文
+_DEFAULT_CONTEXT_MAX_AGE = 300
+# 上下文单条消息的最大文本长度（超出截断，免得一条长消息占满整个上下文）
+_DEFAULT_CONTEXT_TEXT_LIMIT = 60
+# 目标消息正文的最大长度：比上下文宽一些，它是选表情的主要依据
+_TARGET_TEXT_LIMIT = 200
+# 已贴表情记录的条目上限（按消息 ID 记，超了惰性淘汰最旧的）
+_MAX_APPLIED_EMOJI_ENTRIES = 512
+
+# processed_plain_text 里 MaiBot 对非文本消息的常见占位标记 -> 给 LLM 看的类型名。
+# 不标注的话，纯图片/表情消息在 prompt 里就是"内容为空"，LLM 只能瞎猜一个。
+_MEDIA_MARKERS: dict = {
+    "[图片]": "图片",
+    "[动画表情]": "表情",
+    "[表情]": "表情",
+    "[视频]": "视频",
+    "[语音]": "语音",
+    "[文件]": "文件",
+    "[戳一戳]": "戳一戳",
+}
+
 # ---- 传输通道常量 ----
 _TRANSPORT_AUTO = "auto"
 _TRANSPORT_ADAPTER = "adapter"
@@ -200,12 +228,56 @@ class ProactiveConfig(PluginConfigBase):
     )
 
 
+class ContextConfig(PluginConfigBase):
+    """上下文判断配置：决定「用哪些消息、按什么规则」来判断贴什么表情。
+
+    这一节同时作用于主动路径与 Tool 路径，所以独立成节，不塞进 proactive。
+    """
+
+    __ui_label__ = "上下文判断"
+    __ui_icon__ = "message-square"
+    __ui_order__ = 3
+
+    before_count: int = Field(
+        default=_DEFAULT_CONTEXT_BEFORE,
+        description="纳入上下文的「目标消息之前」的消息条数（0-20）；语气、话题、梗都在前文里",
+    )
+    after_count: int = Field(
+        default=_DEFAULT_CONTEXT_AFTER,
+        description="纳入上下文的「目标消息之后」的消息条数（0-10）",
+    )
+    max_age_seconds: int = Field(
+        default=_DEFAULT_CONTEXT_MAX_AGE,
+        description="上下文消息与目标消息的时间差上限（秒），超出视为另一个话题不纳入；0 表示不限",
+    )
+    max_text_length: int = Field(
+        default=_DEFAULT_CONTEXT_TEXT_LIMIT,
+        description="上下文单条消息的最大文本长度（20-200）",
+    )
+    merge_same_sender: bool = Field(
+        default=True,
+        description="同一人连发的多条是否并成一行（QQ 里碎句子很多，合并后话题更清楚）",
+    )
+    skip_when_no_content: bool = Field(
+        default=True,
+        description="目标消息拿不到内容、且上下文也为空时是否跳过；关掉则让 LLM 盲选",
+    )
+    allow_skip: bool = Field(
+        default=False,
+        description=(
+            "是否允许 LLM 判断「这条不值得贴」而跳过（会让它返回 skip=true）。"
+            "开启后贴表情会更克制；关闭则沿用旧行为——无论如何都挑一个"
+        ),
+    )
+
+
 class GroupEmojiReactConfig(PluginConfigBase):
     """插件顶层配置。"""
 
     plugin: PluginSectionConfig = Field(default_factory=PluginSectionConfig)
     napcat: NapcatConfig = Field(default_factory=NapcatConfig)
     proactive: ProactiveConfig = Field(default_factory=ProactiveConfig)
+    context: ContextConfig = Field(default_factory=ContextConfig)
 
 
 def _fix_broken_json(raw: str) -> str:
@@ -228,8 +300,12 @@ def _relative_time(ts: Any) -> str:
     if not ts:
         return "未知"
     diff = time.time() - ts
-    if diff < 60:
+    if diff < 10:
         return "刚刚"
+    # 秒级粒度：群聊里"连着刷了三条"和"隔了半分钟才有人接话"是两种氛围，
+    # 全都写成"刚刚"的话 LLM 看不出节奏。
+    if diff < 60:
+        return f"{int(diff)}秒前"
     if diff < 3600:
         return f"{int(diff // 60)}分钟前"
     if diff < 86400:
@@ -274,6 +350,96 @@ def _is_timeout(exc: BaseException) -> bool:
     )
 
 
+# ---------------------------------------------------------------------------
+# 上下文判断用到的纯函数（不碰 self.ctx，可脱机单测）
+# ---------------------------------------------------------------------------
+def _clamp_int(value: Any, low: int, high: int, default: int) -> int:
+    """把配置值夹成合法整数；解析不出来用默认值。
+
+    配置是用户手改的 toml，写错不该让插件崩，也不该让「写了个负数」变成
+    「取了 -5 条上下文」这种说不通的行为。
+    """
+    try:
+        result = int(value)
+    except (TypeError, ValueError):
+        return default
+    return max(low, min(high, result))
+
+
+def _truthy(value: Any) -> bool:
+    """把 LLM 可能写出的各种「真」归一成 bool。
+
+    JSON 里可能是 true / "true" / "yes" / 1，也可能是字符串 "false"。
+    只判 `is True` 会把 "false" 也漏过去（当成不跳过，还行）；
+    反过来只判 `bool(value)` 会把 "false" 当成真——那会让开了 allow_skip 的
+    插件几乎不再贴任何表情。这里显式列举真值，其余一律算假。
+    """
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return value != 0
+    return str(value or "").strip().lower() in ("true", "1", "yes", "y", "是")
+
+
+def _one_line(value: Any, limit: int) -> str:
+    """压成单行并截断（换行/多余空白会让上下文行数失控）。"""
+    text = str(value or "").replace("\r", " ").replace("\n", " ")
+    text = " ".join(text.split())
+    return text if len(text) <= limit else text[:limit] + "…"
+
+
+def _message_timestamp(msg: Any) -> float:
+    """取消息时间戳；拿不到返回 0（0 表示"没有时间信息"，不要当成 1970 年）。"""
+    if not isinstance(msg, dict):
+        return 0.0
+    for key in ("timestamp", "time", "message_time", "created_at"):
+        try:
+            ts = float(msg.get(key) or 0)
+        except (TypeError, ValueError):
+            continue
+        if ts > 0:
+            return ts
+    return 0.0
+
+
+def _sort_messages_chronologically(messages: list) -> list:
+    """按时间升序（旧 -> 新）排列；时间戳缺失时保持原顺序不动。
+
+    get_recent 的返回顺序由宿主决定（SDK 层没约定），而上下文窗口是
+    「以目标消息为中心取前后各 N 条」——顺序判断错了就会取到完全无关的旧消息，
+    而且**不报错**，只会让 LLM 一直看着错的上下文选表情，是最难排查的那类 bug。
+    有任一条缺时间戳就不猜，保持宿主给的顺序。
+    """
+    items = [m for m in messages if isinstance(m, dict)]
+    if len(items) < 2:
+        return items
+    stamps = [_message_timestamp(m) for m in items]
+    if any(ts <= 0 for ts in stamps):
+        return items
+    return sorted(items, key=_message_timestamp)
+
+
+def _describe_message_kind(text: Any) -> str:
+    """判断消息大致类型：文本 / 图片 / 表情 / 表情+文字 …
+
+    processed_plain_text 对非文本消息只留一个占位标记（如「[图片]」），
+    纯图片消息的正文就是空的。不标注类型，LLM 会以为"这条消息什么都没说"。
+    """
+    raw = str(text or "").strip()
+    if not raw:
+        return "无文本（可能是图片/表情等）"
+    labels: list = []
+    remaining = raw
+    for marker, label in _MEDIA_MARKERS.items():
+        if marker in remaining:
+            labels.append(label)
+            remaining = remaining.replace(marker, " ")
+    if not labels:
+        return "文本"
+    kind = "+".join(dict.fromkeys(labels))  # dict.fromkeys 去重且保序
+    return f"{kind}+文字" if remaining.strip() else kind
+
+
 class GroupEmojiReactPlugin(MaiBotPlugin):
     """群聊贴表情插件。"""
 
@@ -294,6 +460,8 @@ class GroupEmojiReactPlugin(MaiBotPlugin):
         # 替代之前"到 1000 条整体 clear()"——clear 瞬间会让所有历史消息失去去重保护。
         self._reacted_message_ids: set = set()
         self._reacted_message_id_queue: deque = deque(maxlen=_MAX_TRACKED_MESSAGE_IDS)
+        # 每条消息上已贴过的表情（用于上下文里提示 LLM 别重复贴同一个）
+        self._applied_emoji_by_msg: dict = {}
         self._tasks: set = set()
         # 适配器通道状态
         self._adapter_prefix: str = ""          # "" = 尚未解析
@@ -688,6 +856,13 @@ class GroupEmojiReactPlugin(MaiBotPlugin):
             f"（LLM 超时 {self.config.proactive.llm_timeout_ms}ms，"
             f"失败{'回退关键词规则' if self.config.proactive.rule_fallback else '直接跳过'}）"
         )
+        cfg = self._context_cfg()
+        lines.append(
+            f"上下文判断：前 {_clamp_int(cfg.before_count, 0, 20, _DEFAULT_CONTEXT_BEFORE)} 条 / "
+            f"后 {_clamp_int(cfg.after_count, 0, 10, _DEFAULT_CONTEXT_AFTER)} 条，"
+            f"时限 {_clamp_int(cfg.max_age_seconds, 0, 86400, _DEFAULT_CONTEXT_MAX_AGE)}s，"
+            f"{'允许跳过' if cfg.allow_skip else '必选一个'}"
+        )
         lines.append(f"内置表情：{len(AVAILABLE_REACT_EMOJIS)} 个（QQNT emojiId 表）")
         return "\n".join(lines)
 
@@ -733,21 +908,37 @@ class GroupEmojiReactPlugin(MaiBotPlugin):
     ) -> dict:
         """对指定消息贴表情：取上下文 -> LLM 选表情 -> 按通道发出。
 
+        上下文（v1.4.0 起）不是「把最近 N 条原样塞给 LLM」，而是三步收敛：
+          1. 以目标消息为中心截窗口（前 before_count 条 / 后 after_count 条），
+             而不是盲取查询结果的前 N 条——宿主返回的顺序没有约定，盲取会取到
+             另一个话题的旧消息，且不报错，只会让 LLM 一直看着错的上下文选；
+          2. 按时间差裁掉与目标消息相隔过久的；
+          3. 同一人连发的碎句子并成一行；纯图片/表情消息标注类型（否则正文是空的）。
+
+        目标消息正文优先用 fallback_text（入站 hook 拿到的原文）：真机上 get_recent
+        常常查不到刚入站的那条，只用查询结果会让正文变空、LLM 只能瞎猜。
+
         选表情策略（LLM 是唯一选表情路径）：
         - 主动路径（source=proactive）：调 LLM（带 llm_timeout_ms 超时）。
           proactive.rule_fallback=True 时，超时/异常/空返回/解析失败/非法 ID
           回退关键词规则（回退依据 = fallback_text 即 hook 传入的消息原文优先，
           其次目标消息内容）；False 时直接跳过本次贴表情。
         - 工具路径（source=tool）：始终用 LLM，不回退（LLM 主导的场景应由 LLM 决定）。
+        - context.allow_skip=True 时，LLM 可以判断「这条不值得贴」并返回 skip。
         """
         if not group_id:
             return {"success": False, "content": "贴表情仅支持群聊"}
         if not target_msg_id:
             return {"success": False, "content": "没有可用的目标消息"}
 
-        # 只拉一次最近消息（limit=20 覆盖目标查找），目标消息提取与 prompt 上下文
-        #（取前 10 条）复用同一份结果，避免连续两次 get_recent RPC。
-        recent = await self._get_recent_messages(chat_id, limit=20)
+        cfg = self._context_cfg()
+        before = _clamp_int(cfg.before_count, 0, 20, _DEFAULT_CONTEXT_BEFORE)
+        after = _clamp_int(cfg.after_count, 0, 10, _DEFAULT_CONTEXT_AFTER)
+
+        # 只拉一次最近消息：目标消息提取与上下文窗口共用同一份结果，避免两次 RPC。
+        # 窗口是「目标前后各 N 条」，所以要拉够 before+after+余量（默认也比旧版宽）。
+        recent = await self._get_recent_messages(chat_id, limit=max(20, before + after + 6))
+
         user_name, content = "未知用户", ""
         for msg in recent:
             if str(msg.get("message_id", "")) != target_msg_id:
@@ -755,10 +946,26 @@ class GroupEmojiReactPlugin(MaiBotPlugin):
             info = msg.get("message_info") or {}
             user = (info.get("user_info") or {}) if isinstance(info, dict) else {}
             user_name = str(user.get("user_nickname") or "未知用户")
-            content = str(msg.get("processed_plain_text") or "")[:120]
+            content = _one_line(msg.get("processed_plain_text") or "", _TARGET_TEXT_LIMIT)
             break
 
-        prompt = self._build_prompt(target_msg_id, user_name, content, recent[:10])
+        # 目标正文：入站原文优先（真机 get_recent 常常查不到刚入站的那条）
+        target_content = self._first_text(fallback_text, content)
+        context_lines, target_kind = self._build_context(recent, target_msg_id, target_content)
+
+        if cfg.skip_when_no_content and not target_content and not context_lines:
+            return {"success": False, "content": "拿不到目标消息内容、也没有可用上下文，跳过本次贴表情"}
+
+        prompt = self._build_prompt(
+            target_msg_id,
+            user_name,
+            target_content,
+            recent,
+            context_lines=context_lines,
+            target_kind=target_kind,
+            applied_emojis=self._applied_emoji_names(target_msg_id),
+            allow_skip=bool(cfg.allow_skip),
+        )
 
         rule_basis = (
             fallback_text or content
@@ -766,13 +973,19 @@ class GroupEmojiReactPlugin(MaiBotPlugin):
             else ""
         )
         emoji_id, emoji_name, decision = await self._select_emoji(
-            prompt, fallback_text=rule_basis
+            prompt, fallback_text=rule_basis, allow_skip=bool(cfg.allow_skip)
         )
+        if decision == "skip":
+            self.ctx.logger.info(
+                "上下文判断后跳过贴表情: 消息=%s, 理由=%s", target_msg_id, emoji_name
+            )
+            return {"success": False, "content": f"上下文判断后跳过: {emoji_name}"}
         if not emoji_id:
             return {"success": False, "content": f"选表情失败: {emoji_name}"}
 
         ok, detail = await self._apply_emoji_like(target_msg_id, int(emoji_id))
         if ok:
+            self._remember_applied_emoji(target_msg_id, int(emoji_id))
             self.ctx.logger.info(
                 "贴表情成功: source=%s, decision=%s, 通道=%s, 消息=%s, 表情=%s(%s)",
                 source, decision, self._react_transport_used or self._configured_transport(),
@@ -784,6 +997,159 @@ class GroupEmojiReactPlugin(MaiBotPlugin):
             }
         self.ctx.logger.warning("贴表情失败: 消息=%s, 原因=%s", target_msg_id, detail)
         return {"success": False, "content": f"贴表情失败: {detail[:160]}"}
+
+    # ---- 上下文收敛 ----
+    def _context_cfg(self) -> Any:
+        """安全取上下文配置节。
+
+        真机上可能存在没有 [context] 节的旧 config.toml。热重载时 Runner 会补齐
+        默认值，但补齐时机不保证早于首次入站 hook——那一下就会 AttributeError，
+        而且是「插件整体不工作」级别的故障。这里兜一层，拿不到就按类默认构造。
+        """
+        section = getattr(self.config, "context", None)
+        if section is None:
+            section = ContextConfig()
+        return section
+
+    def _select_context_window(self, recent: list, target_msg_id: str) -> tuple:
+        """从最近消息里挑出「目标消息周围的那一段」，返回 (窗口消息, 目标在窗口中的下标)。
+
+        为什么不直接 recent[:N]：宿主返回的顺序没有约定（可能是旧->新也可能是新->旧），
+        而且目标消息未必排在末尾。固定取前 N 条在真机上很容易取到「几分钟前另一个
+        话题」的消息，LLM 对着无关上下文选表情——不报错、不选错得离谱，就是一直不太对，
+        最难排查。
+        """
+        cfg = self._context_cfg()
+        before = _clamp_int(cfg.before_count, 0, 20, _DEFAULT_CONTEXT_BEFORE)
+        after = _clamp_int(cfg.after_count, 0, 10, _DEFAULT_CONTEXT_AFTER)
+        max_age = _clamp_int(cfg.max_age_seconds, 0, 86400, _DEFAULT_CONTEXT_MAX_AGE)
+
+        ordered = _sort_messages_chronologically(recent)
+        if not ordered:
+            return [], -1
+
+        target_index = next(
+            (
+                i
+                for i, msg in enumerate(ordered)
+                if str(msg.get("message_id", "")) == str(target_msg_id)
+            ),
+            -1,
+        )
+
+        if target_index >= 0:
+            start = max(0, target_index - before)
+            end = min(len(ordered), target_index + after + 1)
+            window = ordered[start:end]
+        else:
+            # 目标不在查询结果里（真机常见：刚入站的消息还没落库）。
+            # 它一定是最新的一条，所以取「最新的 before+1 条」当上下文。
+            window = ordered[-(before + 1):]
+
+        if max_age > 0 and window:
+            ref = (
+                _message_timestamp(ordered[target_index])
+                if target_index >= 0
+                else _message_timestamp(window[-1])
+            )
+            if ref <= 0:
+                ref = _message_timestamp(window[-1])
+            if ref > 0:
+                window = [
+                    msg
+                    for msg in window
+                    if not (
+                        _message_timestamp(msg) > 0
+                        and (ref - _message_timestamp(msg)) > max_age
+                    )
+                ]
+
+        # 裁剪后重新定位（比一路维护下标好懂，也不容易错）
+        target_index = next(
+            (
+                i
+                for i, msg in enumerate(window)
+                if str(msg.get("message_id", "")) == str(target_msg_id)
+            ),
+            -1,
+        )
+        return window, target_index
+
+    def _format_context_lines(self, window: list, target_msg_id: str) -> list:
+        """把上下文窗口渲染成给 LLM 看的行。
+
+        同一人连发的多条会并成一行：QQ 里碎句子很多，6 条上下文里可能有 4 条是
+        同一个人拆着发的，不合并的话真正的话题信息会被挤掉。
+        """
+        cfg = self._context_cfg()
+        limit = _clamp_int(cfg.max_text_length, 20, 200, _DEFAULT_CONTEXT_TEXT_LIMIT)
+        merge = bool(getattr(cfg, "merge_same_sender", True))
+
+        rows: list = []
+        for msg in window:
+            info = msg.get("message_info") or {}
+            user = (info.get("user_info") or {}) if isinstance(info, dict) else {}
+            name = str(user.get("user_nickname") or "未知用户")
+            raw = str(msg.get("processed_plain_text") or msg.get("plain_text") or "")
+            is_target = str(msg.get("message_id", "")) == str(target_msg_id)
+            row = {
+                "name": name,
+                "parts": [_one_line(raw, limit)],
+                "ts": _message_timestamp(msg),
+                "kind": _describe_message_kind(raw),
+                "is_target": is_target,
+            }
+            prev = rows[-1] if rows else None
+            if (
+                merge
+                and prev is not None
+                and prev["name"] == name
+                and not is_target
+                and not prev["is_target"]
+            ):
+                prev["parts"].append(row["parts"][0])
+                prev["ts"] = row["ts"] or prev["ts"]
+                continue
+            rows.append(row)
+
+        lines: list = []
+        for row in rows:
+            body = " / ".join(part for part in row["parts"] if part)
+            if not body:
+                body = f"（{row['kind']}）"
+            stamp = _relative_time(row["ts"]) if row["ts"] else "时间未知"
+            marker = "  ← 目标消息" if row["is_target"] else ""
+            lines.append(f"[{stamp}] {row['name']}: {body}{marker}")
+        return lines
+
+    def _build_context(self, recent: list, target_msg_id: str, target_content: str) -> tuple:
+        """返回 (上下文行列表, 目标消息类型描述)。"""
+        window, _ = self._select_context_window(recent, target_msg_id)
+        lines = self._format_context_lines(window, target_msg_id)
+        kind = (
+            _describe_message_kind(target_content)
+            if target_content
+            else "未知（没拿到正文，可能是图片/表情）"
+        )
+        return lines, kind
+
+    def _applied_emoji_names(self, message_id: str) -> list:
+        """这条消息上已经贴过的表情名（用于提示 LLM 别重复贴）。"""
+        ids = self._applied_emoji_by_msg.get(message_id) or set()
+        return [name for eid, name in AVAILABLE_REACT_EMOJIS.items() if eid in ids]
+
+    def _remember_applied_emoji(self, message_id: str, emoji_id: int) -> None:
+        """记录某条消息上贴过的表情；条目超上限时惰性淘汰最早写入的一批。
+
+        只按消息 ID 记，不落盘：重启后信息丢失是可以接受的——它只是"别重复贴"
+        的软提示，丢了最多重复一次，不值得为此引入落盘状态。
+        """
+        if not message_id:
+            return
+        self._applied_emoji_by_msg.setdefault(message_id, set()).add(int(emoji_id))
+        if len(self._applied_emoji_by_msg) > _MAX_APPLIED_EMOJI_ENTRIES:
+            for key in list(self._applied_emoji_by_msg)[: _MAX_APPLIED_EMOJI_ENTRIES // 4]:
+                self._applied_emoji_by_msg.pop(key, None)
 
     # ---- LLM ----
     def _llm_kwargs(self) -> dict:
@@ -837,11 +1203,14 @@ class GroupEmojiReactPlugin(MaiBotPlugin):
             return await coro
         return await asyncio.wait_for(coro, timeout=timeout_ms / 1000.0)
 
-    async def _select_emoji(self, prompt: str, fallback_text: str = "") -> tuple:
+    async def _select_emoji(
+        self, prompt: str, fallback_text: str = "", allow_skip: bool = False
+    ) -> tuple:
         """让 LLM 挑一个表情，返回 (emoji_id, emoji_name, decision)。
 
         decision：表情的最终来源——"llm"=LLM 自己选的；"rule"=超时/异常/空返回/
-        解析失败/非法 ID 后回退关键词规则选的。失败返回 ("", 原因, "")。
+        解析失败/非法 ID 后回退关键词规则选的；"skip"=LLM 判断这条不值得贴
+        （只有 allow_skip=True 时才可能出现）。失败返回 ("", 原因, "")。
 
         fallback_text：LLM 超时/失败时用于规则回退的原文。是否回退由调用方按
         proactive.rule_fallback 开关控制——传非空则超时后回退，传空则超时后直接
@@ -881,6 +1250,9 @@ class GroupEmojiReactPlugin(MaiBotPlugin):
 
         try:
             data = json.loads(_fix_broken_json(content))
+            if allow_skip and _truthy(data.get("skip")):
+                # 上下文判断后主动放弃：这不是失败，调用方不该当成"选表情失败"重试
+                return "", str(data.get("reason") or "上下文表明不适合回应").strip(), "skip"
             emoji_id = str(data.get("emoji_id", "")).strip().strip("\"'")
             emoji_int = int(emoji_id)
             if emoji_int not in AVAILABLE_REACT_EMOJIS:
@@ -935,32 +1307,71 @@ class GroupEmojiReactPlugin(MaiBotPlugin):
         return str(result or "")
 
     def _build_prompt(
-        self, target_msg_id: str, user_name: str, content: str, recent: list
+        self,
+        target_msg_id: str,
+        user_name: str,
+        content: str,
+        recent: list,
+        *,
+        context_lines: list = None,
+        target_kind: str = "",
+        applied_emojis: list = None,
+        allow_skip: bool = False,
     ) -> str:
-        """构造选表情的 prompt。recent 由调用方提供（与目标消息提取共用同一次 get_recent）。"""
+        """构造选表情的 prompt。
 
-        if recent:
-            lines = []
-            for msg in recent:
-                info = msg.get("message_info") or {}
-                user = (info.get("user_info") or {}) if isinstance(info, dict) else {}
-                name = str(user.get("user_nickname") or "未知用户")
-                text = str(msg.get("processed_plain_text") or "").replace("\n", " ").replace("\r", " ")[:50]
-                marker = " [目标消息]" if str(msg.get("message_id", "")) == target_msg_id else ""
-                lines.append(
-                    f"{msg.get('message_id','')},{_relative_time(msg.get('timestamp'))},{name}:{text}{marker}"
-                )
-            context = "\n".join(lines)
+        recent 由调用方提供（与目标消息提取共用同一次 get_recent）；context_lines
+        为空时从 recent 自行推一遍，保证「只传 recent」的调用方也照旧能工作。
+        """
+        if context_lines is None:
+            context_lines, target_kind = self._build_context(recent, target_msg_id, content)
+        elif not target_kind:
+            target_kind = _describe_message_kind(content) if content else "未知"
+
+        context = (
+            "\n".join(context_lines)
+            if context_lines
+            else "（拿不到上下文，只能看目标消息本身，请按字面语气选）"
+        )
+
+        rules = [
+            "1. 先结合上下文弄明白目标消息在说什么——它是在接别人的话、在玩梗、在求助，还是在吐槽",
+            "2. 表情要匹配「上下文里的实际语气」，不能只盯着目标消息的字面意思",
+        ]
+        if applied_emojis:
+            rules.append(
+                f"3. 这条消息上已经贴过 {'、'.join(applied_emojis)}，不要重复贴同一个"
+            )
+        rules.append(f"{len(rules) + 1}. 拿不准就选最不容易出错的（赞 / 呲牙 / 爱心）")
+
+        if allow_skip:
+            rules.append(
+                f"{len(rules) + 1}. 如果上下文表明这条消息根本不适合用表情回应"
+                "（纯通知、纯链接、无人接话的碎句子、含义不明），就跳过不要贴"
+            )
+            output_contract = (
+                '{"skip": false, "emoji_id": "表情ID数字", "reason": "简短理由，10字以内"}\n'
+                "不适合回应时改成：\n"
+                '{"skip": true, "reason": "简短理由，10字以内"}'
+            )
         else:
-            context = "（无法获取最近消息）"
+            output_contract = '{"emoji_id": "表情ID数字", "reason": "简短理由，10字以内"}'
 
+        rules_text = "\n".join(rules)
         return (
             "你是一个正在群里聊天的网友，需要给「目标消息」选一个最合适的反应表情。\n\n"
-            f"目标消息：\n- ID: {target_msg_id}\n- 发送者: {user_name}\n- 内容: {content[:120]}\n\n"
-            f"最近聊天记录（格式：消息ID,时间,昵称:内容）：\n{context}\n\n"
-            f"可用表情（ID:名称）：\n{_EMOJI_LIST_PROMPT}\n\n"
+            "【目标消息】\n"
+            f"- 发送者: {user_name}\n"
+            f"- 类型: {target_kind}\n"
+            f"- 内容: {content[:_TARGET_TEXT_LIMIT] or '（正文为空）'}\n\n"
+            "【上下文】（按时间从旧到新，目标消息已标出）\n"
+            f"{context}\n\n"
+            "【怎么判断】\n"
+            f"{rules_text}\n\n"
+            "【可用表情（ID:名称）】\n"
+            f"{_EMOJI_LIST_PROMPT}\n\n"
             "请只返回一个 JSON 对象，不要有任何解释或多余文字：\n"
-            '{"emoji_id": "表情ID数字", "reason": "简短理由，10字以内"}'
+            f"{output_contract}"
         )
 
     # ---- 消息查询 ----

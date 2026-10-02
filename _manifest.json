@@ -1,9 +1,9 @@
 {
   "manifest_version": 2,
   "id": "org.mai-mai.group-emoji-react",
-  "version": "1.3.0",
+  "version": "1.4.0",
   "name": "群聊贴表情",
-  "description": "让麦麦在群聊里给消息贴 QQ 表情回应：发送通道可走 QQ 适配器插件（SnowLuma / NapCat 统一连接器，adapter.napcat.* / adapter.snowluma.*）或直连 Napcat HTTP，auto 优先适配器、失败自动回落；由 LLM 从 32 个内置表情（QQNT emojiId 表）中挑选，支持「麦麦主动贴」和「LLM 主动贴」两条路径。主动路径带双层 LLM 超时保护，可选关键词规则回退（rule_fallback，默认关闭：失败即跳过）。仅群聊生效，不发送文字、不打断正常聊天。",
+  "description": "让麦麦在群聊里给消息贴 QQ 表情回应：发送通道可走 QQ 适配器插件（SnowLuma / NapCat 统一连接器，adapter.napcat.* / adapter.snowluma.*）或直连 Napcat HTTP，auto 优先适配器、失败自动回落；由 LLM 从 32 个内置表情（QQNT emojiId 表）中挑选，支持「麦麦主动贴」和「LLM 主动贴」两条路径。选表情带上下文判断：以目标消息为中心截窗口（前后各 N 条）、裁掉已换话题的旧消息、同一人连发合并、纯图片/表情消息标注类型，并优先用入站原文补上目标正文。主动路径带双层 LLM 超时保护，可选关键词规则回退（rule_fallback，默认关闭：失败即跳过）；可选允许 LLM 判断「这条不值得贴」而跳过（allow_skip，默认关闭）。仅群聊生效，不发送文字、不打断正常聊天。",
   "author": {
     "name": "orge-8",
     "url": "https://github.com/orge-8"

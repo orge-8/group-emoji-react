@@ -24,10 +24,13 @@ from maibot_sdk.context import PluginContext, PluginPaths  # noqa: E402
 
 import plugin as plugin_module  # noqa: E402
 from plugin import (  # noqa: E402
+    _DEFAULT_CONTEXT_BEFORE,
     _QQNT_FACE_NAMES,
     AVAILABLE_REACT_EMOJIS,
     GroupEmojiReactPlugin,
+    _describe_message_kind,
     _is_timeout,
+    _sort_messages_chronologically,
     create_plugin,
 )
 
@@ -52,6 +55,7 @@ class FakeHost:
         self.llm_reply = llm_reply
         self.llm_delay = llm_delay
         self.no_recent = False  # True 时模拟真机 get_recent 查不到任何消息
+        self.recent_messages = None  # 非 None 时用它替代默认单条（模拟真机上下文）
         self.napcat_calls: list = []
         self.sent_text: list = []
         self.llm_calls: list = []
@@ -101,6 +105,8 @@ class FakeHost:
             self.get_recent_count += 1
             if self.no_recent:
                 return []
+            if self.recent_messages is not None:
+                return self.recent_messages
             return [
                 {
                     "message_id": "555",
@@ -679,6 +685,297 @@ async def test_adapter_unavailable_detected_via_api_list() -> bool:
     return True
 
 
+def _mk_msg(mid: str, name: str, text: str, ts: float = None) -> dict:
+    """构造一条假消息（结构与 FakeHost 默认返回一致）。"""
+    return {
+        "message_id": mid,
+        "processed_plain_text": text,
+        "timestamp": time.time() if ts is None else ts,
+        "message_info": {"user_info": {"user_nickname": name, "user_id": name}},
+    }
+
+
+# ---------------------------------------------------------------------------
+# v1.4.0 新增：上下文判断
+# ---------------------------------------------------------------------------
+async def test_context_window_centers_on_target() -> bool:
+    """上下文窗口必须以目标消息为中心，而不是盲取查询结果的前 N 条。
+
+    宿主返回顺序没有约定（可能旧->新也可能新->旧）。盲取前 N 条在真机上会取到
+    几分钟前另一个话题的旧消息，而且**不报错**——LLM 一直看着错的上下文选表情，
+    表现只是"选得不太对"，最难排查。
+    """
+    now = time.time()
+    msgs = [
+        _mk_msg("1", "路人A", "旧话题旧话题", now - 100),
+        _mk_msg("2", "路人B", "还是旧话题", now - 90),
+        _mk_msg("3", "路人C", "继续旧话题", now - 80),
+        _mk_msg("4", "小明", "换个话题说个事", now - 10),
+        _mk_msg("5", "小红", "你说", now - 5),
+        _mk_msg("6", "小明", "哈哈哈哈哈这也太好笑了", now),  # 目标
+    ]
+    host = FakeHost()
+    plugin = await make_plugin(host, transport="http")
+    plugin.config.context.before_count = 2
+    plugin.config.context.after_count = 0
+    plugin.config.context.max_age_seconds = 0  # 本例只看窗口，不看时限
+
+    window, idx = plugin._select_context_window(msgs, "6")
+    ids = [m["message_id"] for m in window]
+    if ids != ["4", "5", "6"]:
+        print(f"[FAIL] 应取「目标前 2 条 + 目标」，实际 {ids}（盲取前 3 条会得到 ['1','2','3']）")
+        return False
+    if idx != 2:
+        print(f"[FAIL] 目标在窗口中的下标应为 2，实际 {idx}")
+        return False
+
+    # 宿主逆序返回时必须得到同一个窗口
+    window2, _ = plugin._select_context_window(list(reversed(msgs)), "6")
+    ids2 = [m["message_id"] for m in window2]
+    if ids2 != ["4", "5", "6"]:
+        print(f"[FAIL] 逆序输入应得到同一窗口，实际 {ids2}")
+        return False
+    print("[PASS] 上下文窗口以目标为中心（宿主正序/逆序返回都取对）: ['4','5','6']")
+    return True
+
+
+async def test_context_trims_off_topic_messages() -> bool:
+    """与目标消息相隔超过 max_age_seconds 的旧消息应被裁掉（已经是另一个话题了）。"""
+    now = time.time()
+    msgs = [
+        _mk_msg("1", "A", "十分钟前的话题", now - 600),
+        _mk_msg("2", "B", "还是那个话题", now - 590),
+        _mk_msg("3", "小明", "现在说的这个", now - 3),
+        _mk_msg("4", "小明", "哈哈哈哈", now),  # 目标
+    ]
+    host = FakeHost()
+    plugin = await make_plugin(host, transport="http")
+    plugin.config.context.before_count = 6
+    plugin.config.context.after_count = 0
+    plugin.config.context.max_age_seconds = 120
+
+    window, _ = plugin._select_context_window(msgs, "4")
+    ids = [m["message_id"] for m in window]
+    if "1" in ids or "2" in ids:
+        print(f"[FAIL] 超过 120s 的旧话题应被裁掉，实际 {ids}")
+        return False
+    if ids != ["3", "4"]:
+        print(f"[FAIL] 应只剩同一话题的 ['3','4']，实际 {ids}")
+        return False
+    print("[PASS] 超时的旧话题已裁掉（600s 前的消息没进上下文）")
+    return True
+
+
+def test_format_context_merges_same_sender() -> bool:
+    """同一人连发的碎句子应并成一行，否则真正的话题信息会被挤掉。"""
+    now = time.time()
+    msgs = [
+        _mk_msg("1", "小明", "你们看", now - 4),
+        _mk_msg("2", "小明", "这个", now - 3),
+        _mk_msg("3", "小明", "哈哈哈哈哈", now - 2),  # 目标，不与前面合并
+    ]
+    plugin = GroupEmojiReactPlugin()
+    plugin.set_plugin_config(plugin.get_default_config())
+
+    lines = plugin._format_context_lines(msgs, "3")
+    if len(lines) != 2:
+        print(f"[FAIL] 前两条应合并、目标单独一行，共 2 行，实际 {len(lines)}: {lines}")
+        return False
+    if "你们看" not in lines[0] or "这个" not in lines[0]:
+        print(f"[FAIL] 合并行应包含两条内容，实际 {lines[0]}")
+        return False
+    if "← 目标消息" not in lines[1]:
+        print(f"[FAIL] 目标行应有标记，实际 {lines[1]}")
+        return False
+    print(f"[PASS] 同一人连发已合并: {lines[0]}")
+    return True
+
+
+def test_describe_message_kind_annotates_media() -> bool:
+    """纯图片/表情消息（正文为空）必须标出类型，不能让 LLM 以为"什么都没说"。"""
+    cases = [
+        ("", "无文本（可能是图片/表情等）"),
+        ("[图片]", "图片"),
+        ("[图片] 好看吗", "图片+文字"),
+        ("今天天气不错", "文本"),
+        ("[动画表情]", "表情"),
+    ]
+    for raw, expected in cases:
+        got = _describe_message_kind(raw)
+        if got != expected:
+            print(f"[FAIL] _describe_message_kind({raw!r}) 应为 {expected!r}，实际 {got!r}")
+            return False
+    print("[PASS] 消息类型标注正确（纯图片不再被当成空内容）")
+    return True
+
+
+async def test_target_content_uses_incoming_text_when_recent_misses() -> bool:
+    """get_recent 查不到刚入站的消息时，目标正文必须回退到入站原文。
+
+    真机常见：hook 触发时这条消息还没落库。旧实现只用查询结果，于是 prompt 里
+    「内容:」是空的，LLM 只能瞎猜一个表情——这是本次最要紧的一处修复。
+    """
+    now = time.time()
+    host = FakeHost()
+    host.recent_messages = [_mk_msg("1", "小红", "你们看这个", now)]  # 不含目标 555
+    plugin = await make_plugin(host, transport="http")
+
+    await plugin._react_to_message(
+        "chat-1", "123456", "555", source="proactive",
+        fallback_text="哈哈哈哈哈这也太好笑了",
+    )
+    if not host.llm_calls:
+        print("[FAIL] 应调过一次 LLM")
+        return False
+    prompt = str(host.llm_calls[0].get("prompt", ""))
+    if "哈哈哈哈哈这也太好笑了" not in prompt:
+        print(f"[FAIL] prompt 里应带上入站原文，实际片段：\n{prompt[:300]}")
+        return False
+    if "（正文为空）" in prompt:
+        print("[FAIL] 目标正文不应为空")
+        return False
+    print("[PASS] get_recent 查不到目标时，正文回退到入站原文（不再空白）")
+    return True
+
+
+async def test_skip_when_no_content_and_no_context() -> bool:
+    """既拿不到目标内容也没有上下文时，应该直接跳过，不浪费一次 LLM 调用。"""
+    host = FakeHost()
+    host.recent_messages = []
+    plugin = await make_plugin(host, transport="http")
+
+    result = await plugin._react_to_message("chat-1", "123456", "555", source="tool")
+    if result.get("success"):
+        print(f"[FAIL] 无内容无上下文时不应贴表情，实际 {result}")
+        return False
+    if host.llm_calls:
+        print("[FAIL] 信息不足时不该还去调一次 LLM")
+        return False
+
+    # 关掉开关后应恢复"交给 LLM 判断"的旧行为
+    plugin.config.context.skip_when_no_content = False
+    await plugin._react_to_message("chat-1", "123456", "555", source="tool")
+    if not host.llm_calls:
+        print("[FAIL] skip_when_no_content=False 时应仍然调 LLM")
+        return False
+    print(f"[PASS] 信息不足时跳过（且不浪费 LLM）: {result.get('content')}")
+    return True
+
+
+async def test_allow_skip_does_not_react() -> bool:
+    """allow_skip=True 且 LLM 判断不值得贴时，不应发出任何贴表情请求。"""
+    host = FakeHost(llm_reply='{"skip": true, "reason": "纯通知没必要贴"}')
+    plugin = await make_plugin(host, transport="http")
+    plugin.config.context.allow_skip = True
+
+    result = await plugin.react_emoji(
+        target_message_id="555", group_id="123456", chat_id="chat-1"
+    )
+    if result.get("success"):
+        print(f"[FAIL] LLM 判断跳过时不应贴表情，实际 {result}")
+        return False
+    if host.react_calls():
+        print(f"[FAIL] 跳过时不应发出贴表情请求，实际 {len(host.react_calls())} 次")
+        return False
+    if "跳过" not in str(result.get("content", "")):
+        print(f"[FAIL] 回执应说明是跳过，实际 {result}")
+        return False
+    prompt = str(host.llm_calls[0].get("prompt", ""))
+    if '"skip"' not in prompt:
+        print("[FAIL] 开启 allow_skip 时 prompt 应给出带 skip 的输出契约")
+        return False
+    print(f"[PASS] 上下文判断跳过生效且不发请求: {result.get('content')}")
+    return True
+
+
+async def test_skip_flag_string_false_is_not_skip() -> bool:
+    """LLM 把 skip 写成字符串 "false" 时不能当成跳过。
+
+    只判 `bool(value)` 会把 "false" 当成真——那会让开了 allow_skip 的插件
+    几乎不再贴任何表情，而且是静默的。
+    """
+    host = FakeHost(llm_reply='{"skip": "false", "emoji_id": "76", "reason": "确实好笑"}')
+    plugin = await make_plugin(host, transport="http")
+    plugin.config.context.allow_skip = True
+
+    result = await plugin.react_emoji(
+        target_message_id="555", group_id="123456", chat_id="chat-1"
+    )
+    if not result.get("success"):
+        print(f"[FAIL] skip=\"false\" 应正常贴表情，实际 {result}")
+        return False
+    if not host.react_calls():
+        print("[FAIL] 未发出贴表情请求")
+        return False
+    print("[PASS] 字符串 \"false\" 未被误判为跳过")
+    return True
+
+
+async def test_applied_emoji_is_shown_in_context() -> bool:
+    """同一条消息贴过表情后，再贴时 prompt 要提示"别重复贴同一个"。"""
+    host = FakeHost()
+    plugin = await make_plugin(host, transport="http")
+    plugin._remember_applied_emoji("555", 76)
+
+    await plugin._react_to_message("chat-1", "123456", "555", source="tool")
+    prompt = str(host.llm_calls[0].get("prompt", ""))
+    if "已经贴过" not in prompt or "赞" not in prompt:
+        print(f"[FAIL] prompt 应提示已贴过的表情，实际片段：\n{prompt[:300]}")
+        return False
+    print("[PASS] 已贴表情进入上下文（提示不要重复贴同一个）")
+    return True
+
+
+def test_context_section_missing_falls_back_to_defaults() -> bool:
+    """配置对象里没有 context 节时不能崩（真机旧 config.toml 的兼容兜底）。
+
+    正常情况下 SDK 的 merge 会补齐缺失节；但补齐时机不保证早于首次入站 hook，
+    所以插件侧必须能扛住「config 上还没有 context」这一种状态。
+    """
+    plugin = GroupEmojiReactPlugin()
+    plugin.set_plugin_config(plugin.get_default_config())
+
+    class _LegacyConfig:
+        """模拟旧版顶层配置：有 plugin/napcat/proactive，没有 context。"""
+
+        def __init__(self, legacy) -> None:
+            self.plugin = legacy.plugin
+            self.napcat = legacy.napcat
+            self.proactive = legacy.proactive
+
+    # config 是只读 property，直接换掉 SDK 内部持有的强类型实例来模拟
+    plugin._plugin_config_instance = _LegacyConfig(plugin.config)
+    cfg = plugin._context_cfg()
+    if cfg is None or cfg.before_count != _DEFAULT_CONTEXT_BEFORE:
+        print(f"[FAIL] 应回退到默认上下文配置，实际 {cfg}")
+        return False
+
+    # 缺失配置节时，选窗口这条主链路也要能跑通而不是 AttributeError
+    now = time.time()
+    window, _ = plugin._select_context_window([_mk_msg("1", "小明", "哈哈", now)], "1")
+    if len(window) != 1:
+        print(f"[FAIL] 缺配置节时仍应能选出上下文，实际 {len(window)} 条")
+        return False
+    print("[PASS] 配置对象缺 context 节时回退默认值，主链路不崩")
+    return True
+
+
+def test_sort_messages_chronologically_keeps_original_when_no_timestamp() -> bool:
+    """时间戳缺失时不该瞎排序——保持宿主给的原始顺序。"""
+    a = {"message_id": "1", "timestamp": 0}
+    b = {"message_id": "2", "timestamp": 0}
+    if _sort_messages_chronologically([a, b]) != [a, b]:
+        print("[FAIL] 无时间戳时应保持原顺序")
+        return False
+    older = {"message_id": "1", "timestamp": 100}
+    newer = {"message_id": "2", "timestamp": 200}
+    if [m["message_id"] for m in _sort_messages_chronologically([newer, older])] != ["1", "2"]:
+        print("[FAIL] 有时间时应按旧->新排列")
+        return False
+    print("[PASS] 时间排序：有时间戳按旧->新，无时间戳保持原顺序")
+    return True
+
+
 # ---------------------------------------------------------------------------
 # v1.3.0 新增：超时识别 / Bearer 鉴权 / 表情表一致性
 # ---------------------------------------------------------------------------
@@ -871,11 +1168,22 @@ async def main() -> int:
         test_adapter_only_mode_reports_clear_error,
         test_adapter_unavailable_detected_via_api_list,
         test_llm_rpc_timeout_is_wider_than_business_timeout,
+        test_context_window_centers_on_target,
+        test_context_trims_off_topic_messages,
+        test_target_content_uses_incoming_text_when_recent_misses,
+        test_skip_when_no_content_and_no_context,
+        test_allow_skip_does_not_react,
+        test_skip_flag_string_false_is_not_skip,
+        test_applied_emoji_is_shown_in_context,
     ]
     sync_tests = [
         test_is_timeout_recognizes_rpc_error,
         test_http_token_uses_bearer_scheme,
         test_emoji_table_matches_qqnt,
+        test_format_context_merges_same_sender,
+        test_describe_message_kind_annotates_media,
+        test_context_section_missing_falls_back_to_defaults,
+        test_sort_messages_chronologically_keeps_original_when_no_timestamp,
     ]
 
     results = []
